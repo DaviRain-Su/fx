@@ -400,6 +400,7 @@ pub fn loadCatalogStartupStateWithRegistry(
         .profile = profile,
         .host = .{ .secret_store = secret_store },
         .mode = .stored,
+        .source_resolution = .allow_fallback,
     });
     switch (acquisition) {
         .acquired => |value| {
