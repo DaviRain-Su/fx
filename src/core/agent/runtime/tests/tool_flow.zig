@@ -4660,7 +4660,7 @@ test "permission review removes current native images for serial and parallel to
         builtin_tools.web_fetch,
     };
     const capability_overrides = [_]test_support.ModelCapabilityOverride{.{
-        .model = "openai/gpt-5.6-sol",
+        .model = "test/native-review",
         .capabilities = .{
             .supports_tool_use = true,
             .supports_vision = true,
@@ -4693,7 +4693,7 @@ test "permission review removes current native images for serial and parallel to
         };
         var fixture = PromptFixture{};
         var job = fixture.job();
-        job.model = @constCast("openai/gpt-5.6-sol");
+        job.model = @constCast("test/native-review");
         job.prompt = @constCast("Inspect the image before handling the requested tool work.");
         job.images = catalog;
         job.authorized_image_catalog = catalog;
