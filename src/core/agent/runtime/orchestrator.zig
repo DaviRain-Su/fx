@@ -1892,6 +1892,7 @@ noinline fn buildReviewAuthority(
     source_messages: []const ChatMessage,
     history_start_index: usize,
     current_user_message_index: usize,
+    projected_current_user_message_index: ?usize,
     history: []const HistoryTurn,
     current_root_prompt: []const u8,
     pending_user_suffix: []const ChatMessage,
@@ -1901,11 +1902,17 @@ noinline fn buildReviewAuthority(
     var trusted_permission_feedback: std.ArrayList([]const u8) = .empty;
     errdefer trusted_permission_feedback.deinit(alloc);
 
-    const projected_current_user_index = projectedSourceUserIndex(
-        projected_messages,
-        source_messages,
-        current_user_message_index,
-    );
+    const projected_current_user_index = if (projected_current_user_message_index) |index|
+        if (index < projected_messages.len and projected_messages[index].role == .user)
+            index
+        else
+            null
+    else
+        projectedSourceUserIndex(
+            projected_messages,
+            source_messages,
+            current_user_message_index,
+        );
     if (projected_current_user_index) |projected_current| {
         const projected_history_start = if (projected_messages.len <= source_messages.len)
             @min(history_start_index, projected_current)
@@ -2014,6 +2021,7 @@ fn buildReviewTurnContext(
     source_messages: []const ChatMessage,
     history_start_index: usize,
     current_user_message_index: usize,
+    projected_current_user_message_index: ?usize,
     history: []const HistoryTurn,
     current_prompt: []const u8,
     inherited_root_context: []const u8,
@@ -2028,6 +2036,7 @@ fn buildReviewTurnContext(
         source_messages,
         history_start_index,
         current_user_message_index,
+        projected_current_user_message_index,
         history,
         current_prompt,
         pending_user_suffix,
@@ -2259,6 +2268,7 @@ fn processQueuedPromptLoop(
         var gateway_model: []const u8 = job.model;
         var successful_request_messages: []const ChatMessage = &.{};
         var successful_review_messages: []const ChatMessage = &.{};
+        var successful_review_current_user_message_index: ?usize = null;
         var successful_source_messages: []const ChatMessage = &.{};
         var successful_gateway_model: []const u8 = "";
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
@@ -3338,16 +3348,17 @@ fn processQueuedPromptLoop(
                 if (vision_route != .native_images) break :blk request_messages;
                 for (successful_request_messages) |message| {
                     if (message.images.len == 0) continue;
-                    const text_only_source = try runtime_vision_contracts.project_text_only_messages(
-                        overlay_arena,
+                    const review_current_user_message_index = projectedSourceUserIndex(
+                        successful_request_messages,
                         recovery_source_messages,
                         current_user_message_index,
-                        job.authorized_image_catalog,
-                    );
-                    break :blk try runtime_vision_contracts.project_native_messages(
+                    ) orelse return error.MissingUserMessage;
+                    successful_review_current_user_message_index = review_current_user_message_index;
+                    break :blk try runtime_vision_contracts.project_text_only_messages(
                         overlay_arena,
-                        text_only_source,
-                        current_user_message_index,
+                        successful_request_messages,
+                        review_current_user_message_index,
+                        job.authorized_image_catalog,
                     );
                 }
                 break :blk request_messages;
@@ -4303,6 +4314,7 @@ fn processQueuedPromptLoop(
                         successful_source_messages,
                         history_start_index,
                         current_user_message_index,
+                        successful_review_current_user_message_index,
                         job.history,
                         job.prompt,
                         root_user_intent_context,
@@ -5248,6 +5260,7 @@ fn processQueuedPromptLoop(
                 successful_source_messages,
                 history_start_index,
                 current_user_message_index,
+                successful_review_current_user_message_index,
                 job.history,
                 job.prompt,
                 root_user_intent_context,
@@ -6970,6 +6983,7 @@ test "review authority binds current root across a shorter native projection" {
         &source,
         7,
         76,
+        null,
         &.{},
         "Investigate the failed request.",
         &.{},
@@ -7005,6 +7019,7 @@ test "review authority fails closed when a shorter projection omits current root
         &source,
         0,
         1,
+        null,
         &.{},
         source_text,
         &.{},
@@ -7034,6 +7049,7 @@ test "review authority fails closed when current root identity is ambiguous" {
         &source,
         0,
         1,
+        null,
         &.{},
         "Repeated borrowed request.",
         &.{},
@@ -7061,6 +7077,7 @@ test "review authority rejects projected feedback without source proof" {
         &source,
         0,
         0,
+        null,
         &.{},
         "Inspect only.",
         &.{},
@@ -7095,6 +7112,7 @@ test "review authority trusts source feedback retained after a shorter projectio
         &source,
         0,
         3,
+        null,
         &.{},
         "Investigate only.",
         &.{},
@@ -7129,6 +7147,7 @@ test "review authority aligns current root across a projection drop sweep" {
             source,
             7,
             source.len - 1,
+            null,
             &.{},
             "Current root request.",
             &.{},
@@ -7163,6 +7182,7 @@ test "review authority binds only root text before projected image references" {
         &source,
         0,
         0,
+        null,
         &.{},
         "Inspect this image.",
         &.{},
@@ -7188,6 +7208,7 @@ test "review authority rejects arbitrary projection suffixes" {
         &messages,
         0,
         0,
+        null,
         &.{},
         "Inspect this image.",
         &.{},
@@ -7227,6 +7248,7 @@ test "review authority trusts typed feedback after text-only image projection" {
         &source,
         0,
         0,
+        null,
         &.{},
         "Make the requested changes.",
         &.{},

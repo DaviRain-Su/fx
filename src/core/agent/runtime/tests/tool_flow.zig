@@ -4634,11 +4634,13 @@ test "permission review removes current native images for serial and parallel to
                 }
             }
             if (saw_available_images) self.saw_available_images.store(true, .seq_cst);
-            if (review_turn.root_text_bindings.len == 1 and std.mem.eql(
-                u8,
-                review_turn.root_text_bindings[0].text,
-                "Inspect the image before handling the requested tool work.",
-            )) self.saw_exact_root_binding.store(true, .seq_cst);
+            for (review_turn.root_text_bindings) |binding| {
+                if (std.mem.eql(
+                    u8,
+                    binding.text,
+                    "Inspect the image before handling the requested tool work.",
+                )) self.saw_exact_root_binding.store(true, .seq_cst);
+            }
             _ = self.calls.fetchAdd(1, .seq_cst);
             return .{ .decision = .deny };
         }
@@ -4656,6 +4658,7 @@ test "permission review removes current native images for serial and parallel to
     };
     const call_cases = [_][]const ToolCall{ &serial_calls, &parallel_calls };
     const review_tools = [_]tool_dispatch.Tool{
+        builtin_tools.vision,
         builtin_tools.write_file,
         builtin_tools.web_fetch,
     };
@@ -4673,6 +4676,24 @@ test "permission review removes current native images for serial and parallel to
     defer tmp.cleanup();
     const catalog = try makeOwnedVisionCatalog(alloc, tmp.dir, 1);
     defer types.freeImageAttachmentSlice(alloc, catalog);
+    var vision_calls = [_]ToolCall{toolCall("history_vision", "vision", "{}")};
+    var vision_results = [_]types.PersistedToolResult{.{
+        .tool_call_id = @constCast("history_vision"),
+        .tool_name = @constCast("vision"),
+        .status = .failure,
+        .output = @constCast("failed"),
+        .output_bytes = 6,
+        .stored_output_bytes = 6,
+    }};
+    var vision_steps = [_]types.ToolExecutionStep{.{
+        .tool_calls = &vision_calls,
+        .tool_results = &vision_results,
+    }};
+    var history = [_]types.HistoryTurn{.{ .assistant = .{
+        .user = .{ .text = @constCast("Inspect the earlier image."), .images = catalog },
+        .assistant = @constCast("The Vision call failed."),
+        .execution = .{ .tool_steps = &vision_steps },
+    } }};
 
     for (call_cases) |calls| {
         const completions = [_]FakeCompletion{
@@ -4697,16 +4718,18 @@ test "permission review removes current native images for serial and parallel to
         job.prompt = @constCast("Inspect the image before handling the requested tool work.");
         job.images = catalog;
         job.authorized_image_catalog = catalog;
+        job.history = &history;
         job.permission_mode = .auto;
 
         try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
         try std.testing.expectEqual(calls.len, probe.calls.load(.seq_cst));
-        try std.testing.expect(!probe.saw_images.load(.seq_cst));
-        try std.testing.expect(probe.saw_available_images.load(.seq_cst));
-        try std.testing.expect(probe.saw_exact_root_binding.load(.seq_cst));
+        try std.testing.expectEqual(false, probe.saw_images.load(.seq_cst));
+        try std.testing.expectEqual(true, probe.saw_available_images.load(.seq_cst));
+        try std.testing.expectEqual(true, probe.saw_exact_root_binding.load(.seq_cst));
         try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
         try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
+        try expectBodyNotContains(&gateway, 0, "history_vision");
     }
 }
 
