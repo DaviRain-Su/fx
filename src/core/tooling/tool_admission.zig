@@ -3565,7 +3565,7 @@ test "auto-deny-on-ask policy denies only a valid automatic ask" {
     try std.testing.expectEqual(@as(usize, 3), recording.calls);
 }
 
-test "ask-only policy bypasses prompt and reviewer in auto and uses the ordinary prompt in ask" {
+test "Vision bypasses prompt and reviewer in auto and uses the ordinary prompt in ask" {
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();
     var worker: WorkerRuntime = .{};
@@ -3582,21 +3582,12 @@ test "ask-only policy bypasses prompt and reviewer in auto and uses the ordinary
             FakeAutoClassifier.classify,
         ),
     );
-    var ask_only_tool = test_builtin_tools.read_file;
-    ask_only_tool.name = "test_ask_only";
-    ask_only_tool.gateway_schema.name = ask_only_tool.name;
-    ask_only_tool.requires_approval = true;
-    ask_only_tool.approval_policy = .ask_only;
-    ask_only_tool.label_arg_kind = .none;
-    ask_only_tool.label_arg_default = "test input";
-    ask_only_tool.permission_target_kind = .none;
-    const tools = [_]tool_dispatch.Tool{ask_only_tool};
-    input.tool_registry = .{ .tools = tools[0..] };
+    input.tool_registry = .{ .tools = &.{test_builtin_tools.vision} };
     input.permission_prompter = recording.prompter();
     const call = ToolCall{
-        .id = "ask-only-permission",
-        .name = "test_ask_only",
-        .arguments_json = "{}",
+        .id = "vision-permission",
+        .name = "vision",
+        .arguments_json = "{\"image_ids\":[1],\"focus\":\"inspect\"}",
     };
 
     const automatic = try requestPermissionOutcome(

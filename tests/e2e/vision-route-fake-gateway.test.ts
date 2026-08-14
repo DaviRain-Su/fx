@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import {
   copyFileSync,
+  existsSync,
   linkSync,
   mkdirSync,
   mkdtempSync,
@@ -21,7 +22,7 @@ import { FX_BIN, REPO_ROOT, runFx } from "../evals/eval-helpers";
 import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
 
 const TIMEOUT = 15_000;
-const GLM_MODEL = "zai/glm-5.2-fast";
+const GLM_MODEL = "zai/glm-5.2";
 const GEMINI_MODEL = "google/gemini-2.5-flash";
 const IMAGE_PATH = join(REPO_ROOT, "tests/e2e/fixtures/placeholder-logo.png");
 
@@ -50,6 +51,19 @@ function sseText(text: string) {
 
 function sseToolCall(toolName: string, input: object, toolCallId: string) {
   return sseToolCalls([{ toolName, input, toolCallId }]);
+}
+
+function permissionDecision(decision: "allow" | "ask") {
+  return sseToolCall(
+    "permission_decision",
+    {
+      risk: decision === "allow" ? "low" : "high",
+      authorization: "medium",
+      decision,
+      rationale: "deterministic image permission decision",
+    },
+    `permission_${decision}`,
+  );
 }
 
 function sseToolCalls(
@@ -192,8 +206,10 @@ function expectVisionResponseFormat(body: string, imageCount: number) {
 function startImageGateway(
   responses: Response[],
   onChatRequest?: (index: number, body: string) => void,
+  reviewerDecision: "allow" | "ask" = "allow",
 ) {
   const chatRequests: CapturedRequest[] = [];
+  const classifierRequests: CapturedRequest[] = [];
   let catalogRequests = 0;
   const server = Bun.serve({
     port: 0,
@@ -218,6 +234,10 @@ function startImageGateway(
       }
       if (req.method !== "POST") return new Response("not found", { status: 404 });
       const body = await req.text();
+      if (body.includes('"permission_decision"')) {
+        classifierRequests.push({ body, headers: req.headers });
+        return permissionDecision(reviewerDecision);
+      }
       chatRequests.push({ body, headers: req.headers });
       onChatRequest?.(chatRequests.length - 1, body);
       return responses.shift() ?? new Response("unexpected request", { status: 500 });
@@ -228,6 +248,7 @@ function startImageGateway(
     baseUrl: `http://127.0.0.1:${server.port}`,
     chatUrl: `http://127.0.0.1:${server.port}/v3/ai/language-model`,
     chatRequests,
+    classifierRequests,
     get catalogRequests() {
       return catalogRequests;
     },
@@ -701,6 +722,76 @@ describe("Vision route fake Gateway", () => {
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "fx ask reviews the post-Vision command with regular GLM and no file parts",
+    async () => {
+      for (const decision of ["allow", "ask"] as const) {
+        const root = createIsolatedRoot();
+        const fixture = createScopedImageFixture(root);
+        const marker = join(root.workspace, `post-vision-${decision}.txt`);
+        const command = `printf approved > ${JSON.stringify(marker)}`;
+        const responses = [
+          sseToolCall("vision", { image_ids: [1], focus: "inspect" }, `vision_${decision}`),
+          sseText(VISION_RESULT),
+          sseToolCall("run_command", { command }, `command_${decision}`),
+        ];
+        if (decision === "allow") responses.push(sseText("post-Vision command complete"));
+        const gateway = startImageGateway(responses, undefined, decision);
+        try {
+          const result = await runFx(
+            [
+              "ask",
+              "--json",
+              "--auto",
+              "--no-save",
+              "--no-color",
+              "--image",
+              fixture.imagePath,
+              `Inspect the image, then run exactly \`${command}\`.`,
+            ],
+            {
+              cwd: root.workspace,
+              env: {
+                ...fakeGatewayEnv(root, gateway, GLM_MODEL),
+                FX_AUTO_UPGRADE: "0",
+              },
+              timeoutMs: TIMEOUT,
+            },
+          );
+
+          expect(gateway.classifierRequests).toHaveLength(1);
+          const review = gateway.classifierRequests[0]!;
+          expect(review.headers.get("ai-language-model-id")).toBe(GLM_MODEL);
+          expect(review.body).not.toContain('"type":"file"');
+          expect(review.body).toContain("<available_images>");
+          expect(review.body).toContain("printf approved");
+          expect(review.body).toContain(`post-vision-${decision}.txt`);
+          expect(review.body).not.toContain(fixture.imagePath);
+          expect(gateway.chatRequests[0]!.body).not.toContain('"type":"file"');
+          expect(gateway.chatRequests[1]!.body).toContain('"type":"file"');
+          expect(gateway.chatRequests[2]!.body).not.toContain('"type":"file"');
+
+          if (decision === "allow") {
+            expect(result.code).toBe(0);
+            expect(result.stderr.toLowerCase()).not.toContain("error");
+            expect(result.stderr).not.toContain("permission required");
+            expect(existsSync(marker)).toBe(true);
+            expect(gateway.chatRequests).toHaveLength(4);
+          } else {
+            expect(result.code).toBe(1);
+            expect(result.stdout).toContain("NonInteractivePermissionRequired");
+            expect(existsSync(marker)).toBe(false);
+            expect(gateway.chatRequests).toHaveLength(3);
+          }
+        } finally {
+          gateway.stop();
+          rmSync(root.root, { recursive: true, force: true });
+        }
       }
     },
     TIMEOUT,

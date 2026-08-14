@@ -4607,6 +4607,109 @@ test "permission review reaches serial and parallel tools after native history p
     }
 }
 
+test "permission review removes current native images for serial and parallel tools" {
+    const ReviewProjectionProbe = struct {
+        calls: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        saw_images: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        saw_available_images: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        saw_exact_root_binding: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+        fn request(
+            raw: *anyopaque,
+            _: std.mem.Allocator,
+            _: ToolCall,
+            review_turn: permission_auto_classifier.ReviewTurnContext,
+            _: types.PermissionMode,
+            _: []const PermissionGrant,
+            _: ?runtime_tool_contracts.LiveToolAuthority,
+            _: ?runtime_tool_contracts.LivePermissionRevalidation,
+            _: []const []const u8,
+        ) !command_admission.PermissionOutcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var saw_available_images = false;
+            for (review_turn.request_messages) |message| {
+                if (message.images.len != 0) self.saw_images.store(true, .seq_cst);
+                if (std.mem.find(u8, message.content orelse "", "<available_images>") != null) {
+                    saw_available_images = true;
+                }
+            }
+            if (saw_available_images) self.saw_available_images.store(true, .seq_cst);
+            if (review_turn.root_text_bindings.len == 1 and std.mem.eql(
+                u8,
+                review_turn.root_text_bindings[0].text,
+                "Inspect the image before handling the requested tool work.",
+            )) self.saw_exact_root_binding.store(true, .seq_cst);
+            _ = self.calls.fetchAdd(1, .seq_cst);
+            return .{ .decision = .deny };
+        }
+    };
+
+    const alloc = std.testing.allocator;
+    const serial_calls = [_]ToolCall{toolCall(
+        "serial_write",
+        "write_file",
+        "{\"path\":\"blocked.txt\",\"content\":\"blocked\"}",
+    )};
+    const parallel_calls = [_]ToolCall{
+        toolCall("parallel_fetch_1", "web_fetch", "{\"url\":\"https://one.example\"}"),
+        toolCall("parallel_fetch_2", "web_fetch", "{\"url\":\"https://two.example\"}"),
+    };
+    const call_cases = [_][]const ToolCall{ &serial_calls, &parallel_calls };
+    const review_tools = [_]tool_dispatch.Tool{
+        builtin_tools.write_file,
+        builtin_tools.web_fetch,
+    };
+    const capability_overrides = [_]test_support.ModelCapabilityOverride{.{
+        .model = "openai/gpt-5.6-sol",
+        .capabilities = .{
+            .supports_tool_use = true,
+            .supports_vision = true,
+            .supports_file_input = true,
+            .parallel_tool_calls = true,
+        },
+    }};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const catalog = try makeOwnedVisionCatalog(alloc, tmp.dir, 1);
+    defer types.freeImageAttachmentSlice(alloc, catalog);
+
+    for (call_cases) |calls| {
+        const completions = [_]FakeCompletion{
+            .{ .tool_calls = calls },
+            .{ .content = "Final" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        defer hooks.deinit();
+        hooks.tool_registry = .{ .tools = &review_tools };
+        hooks.available_capability_overrides = &capability_overrides;
+        hooks.capability_overrides = &capability_overrides;
+        var probe = ReviewProjectionProbe{};
+        hooks.permission_request_override = .{
+            .context = &probe,
+            .request_fn = ReviewProjectionProbe.request,
+        };
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast("openai/gpt-5.6-sol");
+        job.prompt = @constCast("Inspect the image before handling the requested tool work.");
+        job.images = catalog;
+        job.authorized_image_catalog = catalog;
+        job.permission_mode = .auto;
+
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+
+        try std.testing.expectEqual(calls.len, probe.calls.load(.seq_cst));
+        try std.testing.expect(!probe.saw_images.load(.seq_cst));
+        try std.testing.expect(probe.saw_available_images.load(.seq_cst));
+        try std.testing.expect(probe.saw_exact_root_binding.load(.seq_cst));
+        try std.testing.expectEqual(@as(usize, 0), hooks.executed_names.items.len);
+        try expectBodyContains(&gateway, 0, "\"type\":\"file\"");
+    }
+}
+
 test "permission feedback follows the matching tool result" {
     const alloc = std.testing.allocator;
     const calls = [_]ToolCall{toolCall("call_read", "read_file", "{\"path\":\"README.md\"}")};

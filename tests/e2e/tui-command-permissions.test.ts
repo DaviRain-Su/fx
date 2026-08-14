@@ -5578,7 +5578,7 @@ describe("effect-aware command permissions", () => {
       expect(gateway.requests).toHaveLength(2);
       expect(gateway.classifierRequests).toHaveLength(1);
       expect(gateway.classifierRequests[0]!.headers.get("ai-language-model-id")).toBe(
-        "openai/gpt-5.4",
+        "zai/glm-5.2",
       );
       expect(gateway.classifierRequests[0]!.body).toContain("\"permission_decision\"");
       expect(gateway.classifierRequests[0]!.body).toContain("\"toolChoice\":{\"type\":\"required\"}");

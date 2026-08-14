@@ -2258,6 +2258,7 @@ fn processQueuedPromptLoop(
         var stream_result_set = false;
         var gateway_model: []const u8 = job.model;
         var successful_request_messages: []const ChatMessage = &.{};
+        var successful_review_messages: []const ChatMessage = &.{};
         var successful_source_messages: []const ChatMessage = &.{};
         var successful_gateway_model: []const u8 = "";
         var successful_vision_route: runtime_vision_contracts.VisionRoute = .native_images;
@@ -3333,6 +3334,24 @@ fn processQueuedPromptLoop(
             }
 
             successful_request_messages = request_messages;
+            successful_review_messages = blk: {
+                if (vision_route != .native_images) break :blk request_messages;
+                for (successful_request_messages) |message| {
+                    if (message.images.len == 0) continue;
+                    const text_only_source = try runtime_vision_contracts.project_text_only_messages(
+                        overlay_arena,
+                        recovery_source_messages,
+                        current_user_message_index,
+                        job.authorized_image_catalog,
+                    );
+                    break :blk try runtime_vision_contracts.project_native_messages(
+                        overlay_arena,
+                        text_only_source,
+                        current_user_message_index,
+                    );
+                }
+                break :blk request_messages;
+            };
             successful_source_messages = recovery_source_messages;
             successful_gateway_model = gateway_model;
             successful_vision_route = vision_route;
@@ -4280,7 +4299,7 @@ fn processQueuedPromptLoop(
                         arena,
                         config,
                         successful_gateway_model,
-                        successful_request_messages,
+                        successful_review_messages,
                         successful_source_messages,
                         history_start_index,
                         current_user_message_index,
@@ -5225,7 +5244,7 @@ fn processQueuedPromptLoop(
                 call_allocator,
                 config,
                 successful_gateway_model,
-                successful_request_messages,
+                successful_review_messages,
                 successful_source_messages,
                 history_start_index,
                 current_user_message_index,

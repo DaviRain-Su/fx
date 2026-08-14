@@ -12,7 +12,7 @@ const types = @import("../shared/types.zig");
 pub const tool_name = "permission_decision";
 const max_rationale_bytes: usize = 240;
 const max_review_sends: usize = 2;
-const reviewer_model = "openai/gpt-5.4";
+const reviewer_model = "zai/glm-5.2";
 
 pub const Risk = enum {
     low,
