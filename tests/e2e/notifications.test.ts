@@ -323,8 +323,11 @@ test.skipIf(!tmuxAvailable())(
         cwd: fixture.workspace,
         env: notificationEnv(fixture.home, gateway, tracePath),
         stderrPath,
+        isolated: true,
       });
       await session.waitForComposer(TIMEOUT);
+      session.enableBellMonitoring();
+      expect(session.windowBellFlag()).toBe(false);
       await session.sendText("Try the prepared command.");
       await session.waitForText(COMMAND_APPROVAL_PROMPT, TIMEOUT);
       const waitingTrace = await waitForTrace(
@@ -334,6 +337,8 @@ test.skipIf(!tmuxAvailable())(
 
       expect(handlerStartCount(waitingTrace, "AttentionRequired")).toBe(1);
       expect(waitingTrace).toContain("handler=fx.sound.attention_required");
+      expect(waitingTrace).toContain("terminal_bell=true");
+      expect(session.windowBellFlag()).toBe(true);
       expect(existsSync(marker)).toBe(false);
 
       await session.sendKeys("3");

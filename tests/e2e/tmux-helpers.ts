@@ -974,6 +974,43 @@ export class TmuxSession {
     return value;
   }
 
+  enableBellMonitoring(): void {
+    execFileSync(
+      "tmux",
+      this.tmuxArgs(["set-option", "-t", this.name, "bell-action", "any"]),
+      { stdio: "pipe" },
+    );
+    execFileSync(
+      "tmux",
+      this.tmuxArgs([
+        "set-window-option",
+        "-t",
+        `${this.name}:0`,
+        "monitor-bell",
+        "on",
+      ]),
+      { stdio: "pipe" },
+    );
+  }
+
+  windowBellFlag(): boolean {
+    const raw = execFileSync(
+      "tmux",
+      this.tmuxArgs([
+        "display-message",
+        "-t",
+        `${this.name}:0`,
+        "-p",
+        "#{window_bell_flag}",
+      ]),
+      { stdio: "pipe", encoding: "utf-8" },
+    ).trim();
+    if (raw !== "0" && raw !== "1") {
+      throw new Error(`Invalid tmux window bell flag: ${JSON.stringify(raw)}`);
+    }
+    return raw === "1";
+  }
+
   paneStatus(): { dead: boolean; status: number | null } {
     try {
       const raw = execSync(

@@ -197,7 +197,7 @@ fn Runtime(comptime App: type) type {
                 );
                 return;
             };
-            deliver(player, .attention_required, .success, ready.attention_required);
+            deliverAttention(player, ready.attention_required);
             deliver(player, .turn_end, .success, ready.turn_end_success);
             deliver(player, .turn_end, .@"error", ready.turn_end_error);
         }
@@ -274,6 +274,20 @@ fn Runtime(comptime App: type) type {
                     .{ @tagName(kind), @tagName(cue) },
                 );
                 player.play(cue);
+            }
+        }
+
+        fn deliverAttention(
+            player: *notification_sound.Player,
+            count: usize,
+        ) void {
+            for (0..count) |_| {
+                debug_trace.logf(
+                    "notifications",
+                    "sound play kind={s} cue={s} terminal_bell=true",
+                    .{ @tagName(Kind.attention_required), @tagName(Cue.success) },
+                );
+                player.playAttention(.success);
             }
         }
 
