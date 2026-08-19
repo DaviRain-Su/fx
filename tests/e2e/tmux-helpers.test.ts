@@ -120,6 +120,36 @@ test("observed command keeps wrapper signal diagnostics out of captured stderr",
   }
 });
 
+tmuxTest("bell monitoring clears earlier alerts and observes the next bell", async () => {
+  let session: TmuxSession | undefined;
+  try {
+    session = await TmuxSession.create({
+      cmd: "/bin/sh",
+      isolated: true,
+      startupWaitMs: 100,
+    });
+
+    await session.sendText("printf '\\a'");
+    const firstBellDeadline = Date.now() + 2_000;
+    while (!session.windowBellFlag() && Date.now() < firstBellDeadline) {
+      await Bun.sleep(25);
+    }
+    expect(session.windowBellFlag()).toBe(true);
+
+    session.enableBellMonitoring();
+    expect(session.windowBellFlag()).toBe(false);
+
+    await session.sendText("printf '\\a'");
+    const secondBellDeadline = Date.now() + 2_000;
+    while (!session.windowBellFlag() && Date.now() < secondBellDeadline) {
+      await Bun.sleep(25);
+    }
+    expect(session.windowBellFlag()).toBe(true);
+  } finally {
+    await session?.kill();
+  }
+});
+
 tmuxTest("tmux launch scrubs stale overrides without storing explicit credentials", async () => {
   const socketName = `fx-env-isolation-${process.pid}-${Date.now()}`;
   const root = mkdtempSync(join(tmpdir(), "fx-tmux-env-isolation-"));

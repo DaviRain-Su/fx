@@ -991,6 +991,40 @@ export class TmuxSession {
       ]),
       { stdio: "pipe" },
     );
+
+    // tmux keeps the window bell flag set until another window is selected.
+    // Establish a clean observation baseline without requiring an attached
+    // client, then let the next BEL set the flag under test.
+    const resetWindow = execFileSync(
+      "tmux",
+      this.tmuxArgs([
+        "new-window",
+        "-d",
+        "-P",
+        "-F",
+        "#{window_id}",
+        "-t",
+        this.name,
+        "sleep 60",
+      ]),
+      { stdio: "pipe", encoding: "utf-8" },
+    ).trim();
+    if (!resetWindow.startsWith("@")) {
+      throw new Error(`Invalid tmux reset window: ${JSON.stringify(resetWindow)}`);
+    }
+    try {
+      execFileSync(
+        "tmux",
+        this.tmuxArgs(["select-window", "-t", resetWindow]),
+        { stdio: "pipe" },
+      );
+    } finally {
+      execFileSync(
+        "tmux",
+        this.tmuxArgs(["kill-window", "-t", resetWindow]),
+        { stdio: "pipe" },
+      );
+    }
   }
 
   windowBellFlag(): boolean {
