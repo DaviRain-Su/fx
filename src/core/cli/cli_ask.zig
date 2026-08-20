@@ -4133,7 +4133,7 @@ test "Ask root and child credentials require the exact admitted route" {
     const cfg = testConfig();
     var ctx = AskContext.init(alloc, cfg, .{
         .context_registry = test_no_context_registry,
-        .tool_set = test_builtin_tools.advertisement_set,
+        .tool_set = builtin_tools.advertisement_set,
         .load_mcp_runtime = testNoMcpRuntime,
     }, "/tmp/workspace");
     defer ctx.deinit();
@@ -4836,7 +4836,7 @@ test "production Ask loads configuration before registry credential acquisition"
     const deps = productionRunDeps(
         testConfig(),
         test_no_context_registry,
-        test_builtin_tools.advertisement_set,
+        builtin_tools.advertisement_set,
     );
     try std.testing.expect(deps.load_startup_state == loadStartupStateWithoutCredentialsDefault);
     try std.testing.expect(deps.resolve_connection_credential == app_lifecycle.resolveConnectionCredential);
