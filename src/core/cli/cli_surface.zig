@@ -1294,7 +1294,7 @@ fn runNonInteractiveWithDeps(
 
             switch (target) {
                 .last => {
-                    var summary = store.latestReadOnlyWorkspaceSummary(alloc) catch |err| {
+                    var summary = store.latestResumableWorkspaceSummary(alloc) catch |err| {
                         try writeLookupFailure(alloc, deps, "session", err, opts.format);
                         return .handled_failure;
                     };
