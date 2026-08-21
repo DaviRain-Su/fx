@@ -549,7 +549,8 @@ test "built-in paste completion describes clipboard image attachment" {
 }
 
 test "built-in statusline help and completion include workspace" {
-    const help = try renderSlashHelp(std.testing.allocator);
+    const slash_registry = testSlashRegistry();
+    const help = try command_specs.renderSlashHelp(std.testing.allocator, slash_registry);
     defer std.testing.allocator.free(help);
     try std.testing.expect(
         std.mem.find(u8, help, "/statusline [sandbox|context|session|workspace]") != null,
@@ -557,7 +558,7 @@ test "built-in statusline help and completion include workspace" {
 
     try std.testing.expectEqualStrings(
         "/statusline workspace",
-        nthSlashCompletion("/statusline w", 0).?,
+        command_specs.nthSlashCompletion(slash_registry, "/statusline w", 0).?,
     );
 }
 
