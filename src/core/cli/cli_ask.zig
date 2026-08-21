@@ -4092,7 +4092,7 @@ test "ask refresh handles every adapter acquisition outcome without fallback" {
     cfg.gateway_provider.adapter_registry = try adapter_registry.AdapterRegistry.init(&adapters);
     var ctx = AskContext.init(std.testing.allocator, cfg, .{
         .context_registry = test_no_context_registry,
-        .tool_set = test_builtin_tools.advertisement_set,
+        .tool_set = builtin_tools.advertisement_set,
         .load_mcp_runtime = testNoMcpRuntime,
     }, "/tmp/workspace");
     defer ctx.deinit();
