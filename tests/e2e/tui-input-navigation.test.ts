@@ -803,6 +803,31 @@ tmuxTest(
 );
 
 tmuxTest(
+  "composer accepts legacy application-keypad SS3 keys",
+  async () => {
+    const active = await startFx(80, 24, true);
+
+    // A terminal left in keypad application mode reports `ESC O <byte>`.
+    await active.sendHexBytes(hexSeq("\x1bOp")); // KP_0
+    await active.sendHexBytes(hexSeq("\x1bOy")); // KP_9
+    await active.sendHexBytes(hexSeq("\x1bOo")); // KP_DIVIDE
+    await active.sendHexBytes(hexSeq("\x1bOm")); // KP_SUBTRACT
+    await waitForActiveFooter(active, (footer) => footer === "┃ 09/-");
+
+    // Keypad Enter submits under the same encoding.
+    await active.sendHexBytes(hexSeq("\x1bOM"));
+    await active.waitForPane(
+      (pane) => pane.includes("history prompt complete"),
+      READY_TIMEOUT,
+    );
+
+    expect(active.isAlive()).toBe(true);
+    expectCleanStderr();
+  },
+  TIMEOUT,
+);
+
+tmuxTest(
   "composer aliases edit through raw controls and meta delete",
   async () => {
     const active = await startFx(80, 24, true);

@@ -647,6 +647,18 @@ pub fn consumeInputEscapeByteWithMouse(
                 },
                 'H' => .home,
                 'F' => .end,
+                // A terminal left in keypad application mode reports `ESC O`
+                // followed by these bytes, which must decode exactly like the
+                // kitty keypad codes.
+                'p'...'y' => .{ .remapped_byte = @intCast('0' + (byte - 'p')) },
+                'l' => .{ .remapped_byte = ',' },
+                'n' => .{ .remapped_byte = '.' },
+                'j' => .{ .remapped_byte = '*' },
+                'k' => .{ .remapped_byte = '+' },
+                'm' => .{ .remapped_byte = '-' },
+                'o' => .{ .remapped_byte = '/' },
+                'M' => .{ .remapped_byte = '\r' },
+                'X' => .{ .remapped_byte = '=' },
                 else => return beginControlSequenceDiscard(stage, param, param2, mouse, byte),
             };
             resetMouseEscapeDecode(stage, param, param2, mouse);

@@ -2136,6 +2136,36 @@ test "input escape parser resolves keypad keys reported with an event type" {
     try expectEscapeAction("[57419;1:1u", .cursor_up);
 }
 
+test "input escape parser decodes application-keypad SS3 keys" {
+    // A terminal left in keypad application mode reports `ESC O <byte>`.
+    try expectEscapeAction("Op", .{ .remapped_byte = '0' });
+    try expectEscapeAction("Oq", .{ .remapped_byte = '1' });
+    try expectEscapeAction("Ox", .{ .remapped_byte = '8' });
+    try expectEscapeAction("Oy", .{ .remapped_byte = '9' });
+    try expectEscapeAction("Ol", .{ .remapped_byte = ',' });
+    try expectEscapeAction("On", .{ .remapped_byte = '.' });
+    try expectEscapeAction("Oj", .{ .remapped_byte = '*' });
+    try expectEscapeAction("Ok", .{ .remapped_byte = '+' });
+    try expectEscapeAction("Om", .{ .remapped_byte = '-' });
+    try expectEscapeAction("Oo", .{ .remapped_byte = '/' });
+    try expectEscapeAction("OM", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("OX", .{ .remapped_byte = '=' });
+    // Arrows, Home, and End keep their existing SS3 mapping.
+    try expectEscapeAction("OA", .cursor_up);
+    try expectEscapeAction("OB", .cursor_down);
+    try expectEscapeAction("OC", .cursor_right);
+    try expectEscapeAction("OD", .cursor_left);
+    try expectEscapeAction("OH", .home);
+    try expectEscapeAction("OF", .end);
+    // F1-F4 and the keypad bytes with no main-row equivalent stay unmapped.
+    try expectEscapeAction("OP", .ignore);
+    try expectEscapeAction("OQ", .ignore);
+    try expectEscapeAction("OR", .ignore);
+    try expectEscapeAction("OS", .ignore);
+    try expectEscapeAction("OE", .ignore);
+    try expectEscapeAction("OI", .ignore);
+}
+
 test "input escape parser preserves double escape meta behavior" {
     try expectEscapeAction("\x1b[A", moveEscape(.paragraph_up, false));
     try expectEscapeAction("\x1b[B", moveEscape(.paragraph_down, false));
