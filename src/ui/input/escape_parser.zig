@@ -37,6 +37,27 @@ const sgr_mouse_max_bytes: u8 = 18;
 const control_sequence_discard_max_bytes: u16 = 32;
 const kitty_up_key: u16 = 57352;
 const kitty_down_key: u16 = 57353;
+// Kitty reports every keypad key as its own function code. KP_SEPARATOR (57416),
+// KP_INSERT (57425), and KP_BEGIN (57427) have no main-row equivalent fx can
+// act on and stay unmapped.
+const kp_0: u16 = 57399;
+const kp_9: u16 = 57408;
+const kp_decimal: u16 = 57409;
+const kp_divide: u16 = 57410;
+const kp_multiply: u16 = 57411;
+const kp_subtract: u16 = 57412;
+const kp_add: u16 = 57413;
+const kp_enter: u16 = 57414;
+const kp_equal: u16 = 57415;
+const kp_left: u16 = 57417;
+const kp_right: u16 = 57418;
+const kp_up: u16 = 57419;
+const kp_down: u16 = 57420;
+const kp_page_up: u16 = 57421;
+const kp_page_down: u16 = 57422;
+const kp_home: u16 = 57423;
+const kp_end: u16 = 57424;
+const kp_delete: u16 = 57426;
 const shift_modifier: u16 = 0x01;
 const alt_modifier: u16 = 0x02;
 const ctrl_modifier: u16 = 0x04;
@@ -92,6 +113,65 @@ fn ctrlOKeyAction(meta_prefixed: bool, modifiers: u16) InputEscapeAction {
     return .ignore;
 }
 
+// A keypad key must behave as its non-keypad equivalent, so each keypad code is
+// translated to the main-row character or navigation letter and resolved with
+// the same logic the main row uses.
+const keypad_supported_modifiers: u16 = shift_modifier | alt_modifier | ctrl_modifier | super_modifier;
+
+fn keypadCharacterKey(keycode: u16) ?u8 {
+    if (keycode >= kp_0 and keycode <= kp_9) return @intCast('0' + (keycode - kp_0));
+    return switch (keycode) {
+        kp_decimal => '.',
+        kp_divide => '/',
+        kp_multiply => '*',
+        kp_subtract => '-',
+        kp_add => '+',
+        kp_equal => '=',
+        else => null,
+    };
+}
+
+fn keypadNavigationKey(keycode: u16) ?u8 {
+    return switch (keycode) {
+        kp_up => 'A',
+        kp_down => 'B',
+        kp_right => 'C',
+        kp_left => 'D',
+        kp_home => 'H',
+        kp_end => 'F',
+        else => null,
+    };
+}
+
+// Reuse the main-row arrow mapping so Shift extends the selection and
+// Ctrl/Alt/Super keep their word, paragraph, and draft jumps.
+fn navigationKeyAction(letter: u8, modifiers: u16, meta_prefixed: bool) InputEscapeAction {
+    const plain: InputEscapeAction = switch (letter) {
+        'A' => .cursor_up,
+        'B' => .cursor_down,
+        'C' => .cursor_right,
+        'D' => .cursor_left,
+        'H' => .home,
+        'F' => .end,
+        else => unreachable,
+    };
+    if (!meta_prefixed and modifiers == 0) return plain;
+    return modifiedArrowAction(letter, modifiers, meta_prefixed) orelse plain;
+}
+
+fn pageKeyAction(keycode: u16, modifiers: u16) InputEscapeAction {
+    const kind: input_action.MoveKind = if (keycode == kp_page_up) .page_up else .page_down;
+    if (modifiers != 0) return composerMove(kind, modifiers);
+    return if (keycode == kp_page_up) .page_up else .page_down;
+}
+
+// Keypad Delete mirrors the main-row `ESC[3~` family.
+fn forwardDeleteKeyAction(modifiers: u16) InputEscapeAction {
+    if ((modifiers & super_modifier) != 0) return .delete_to_line_end;
+    if ((modifiers & (alt_modifier | ctrl_modifier)) != 0) return .delete_word_right;
+    return .delete_next;
+}
+
 // Resolve a Kitty CSI u report (`ESC[<keycode>;<mod>u`). Shared by the
 // single-parameter and modifier stages, and never returns null so the leading
 // ESC's pending-cancel is always cleared.
@@ -99,6 +179,25 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
     // Strip Caps Lock (bit 6) and Num Lock (bit 7) — lock states, not modifiers.
     const mods = modifiers & 0x3F;
     if (keycode == 27 and mods == 0) return .escape;
+    // Hyper and Meta survive the lock-state mask, so a keypad key held with one
+    // of them keeps today's behavior instead of typing text or moving the caret.
+    if ((mods & ~keypad_supported_modifiers) == 0) {
+        if (keypadCharacterKey(keycode)) |byte| {
+            // Only a bare or Shift-modified keypad press types text, matching
+            // the main row where modified digits and operators are not text.
+            if ((mods & ~shift_modifier) == 0) return .{ .remapped_byte = byte };
+        } else if (keypadNavigationKey(keycode)) |letter| {
+            return navigationKeyAction(letter, mods, meta_prefixed);
+        } else if (keycode == kp_page_up or keycode == kp_page_down) {
+            return pageKeyAction(keycode, mods);
+        } else if (keycode == kp_enter) {
+            // Reuse the main-row Enter branch: Ctrl submits, Shift and Alt
+            // insert a newline, and a bare press submits.
+            return kittyUnicodeKeyAction(13, modifiers, meta_prefixed);
+        } else if (keycode == kp_delete) {
+            return forwardDeleteKeyAction(mods);
+        }
+    }
     if (keycode == kitty_up_key or keycode == kitty_down_key) {
         if (meta_prefixed or mods != 0) {
             return modifiedArrowAction(
@@ -567,11 +666,12 @@ pub fn consumeInputEscapeByteWithMouse(
                 return null;
             }
 
-            // Ghostty can report a Kitty key event type as a colon-qualified
-            // modifier, e.g. `ESC[27;1:1u` for an Escape key press.
-            if (byte == ':' and param2.* == 27) {
-                param2.* = if (param.* > 0) param.* - 1 else 0;
-                param.* = 0;
+            // Kitty reports key event types as a colon-qualified modifier, e.g.
+            // `ESC[27;1:1u` for an Escape key press. The keycode stays in
+            // param2 and the modifiers move into param with the event type.
+            if (byte == ':') {
+                const raw_modifiers = if (param.* > 0) param.* - 1 else 0;
+                param.* = raw_modifiers << 4;
                 setBaseEscapeStage(stage, kitty_escape_event_type_stage);
                 return null;
             }
@@ -657,19 +757,22 @@ pub fn consumeInputEscapeByteWithMouse(
 
             return beginControlSequenceDiscard(stage, param, param2, mouse, byte);
         },
-        // Kitty key reports with an event type: `ESC[27;modifier:event-type u`.
-        // Only press and repeat are actionable; release must not close a panel.
+        // Kitty key reports with an event type: `ESC[<keycode>;modifier:event-type u`.
+        // Only press (1) and repeat (2) are actionable; release (3) must not
+        // close a panel or move the caret.
         kitty_escape_event_type_stage => {
             if (byte >= '0' and byte <= '9') {
-                appendCsiDigitSaturating(param, byte);
+                param.* = (param.* & 0xFFF0) | (byte - '0');
                 return null;
             }
             if (byte == 'u') {
-                const modifiers = param2.*;
-                const event_type = param.*;
+                const meta_prefixed = hasMetaPrefix(stage.*);
+                const keycode = param2.*;
+                const modifiers = param.* >> 4;
+                const event_type = param.* & 0x0F;
                 resetMouseEscapeDecode(stage, param, param2, mouse);
-                if (event_type == 1 or event_type == 2) {
-                    return kittyUnicodeKeyAction(27, modifiers, false);
+                if (event_type == 0 or event_type == 1 or event_type == 2) {
+                    return kittyUnicodeKeyAction(keycode, modifiers, meta_prefixed);
                 }
                 return .ignore;
             }

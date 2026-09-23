@@ -2077,6 +2077,65 @@ test "input escape parser preserves modified arrow intent" {
     try expectEscapeAction("[1;4D", moveEscape(.word_left, true));
 }
 
+test "input escape parser maps kitty keypad keys to their main-row characters" {
+    // Kitty reports keypad keys as dedicated codes: KP_0..KP_9 = 57399-57408.
+    try expectEscapeAction("[57399u", .{ .remapped_byte = '0' });
+    try expectEscapeAction("[57408u", .{ .remapped_byte = '9' });
+    try expectEscapeAction("[57400;1u", .{ .remapped_byte = '1' });
+    // Num Lock (bit 7) is a lock state, not a modifier.
+    try expectEscapeAction("[57400;129u", .{ .remapped_byte = '1' });
+    try expectEscapeAction("[57409u", .{ .remapped_byte = '.' });
+    try expectEscapeAction("[57410u", .{ .remapped_byte = '/' });
+    try expectEscapeAction("[57411u", .{ .remapped_byte = '*' });
+    try expectEscapeAction("[57412u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57413u", .{ .remapped_byte = '+' });
+    try expectEscapeAction("[57415u", .{ .remapped_byte = '=' });
+    // Shift keeps the character; the main row has no text for the other
+    // modifiers, and Hyper/Meta must not start typing digits either.
+    try expectEscapeAction("[57412;2u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57410;3u", .ignore);
+    try expectEscapeAction("[57410;5u", .ignore);
+    try expectEscapeAction("[57412;9u", .ignore);
+    try expectEscapeAction("[57412;17u", .ignore);
+    try expectEscapeAction("[57412;33u", .ignore);
+}
+
+test "input escape parser keeps keypad Enter, navigation, and Delete contracts" {
+    try expectEscapeAction("[57414u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;5u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57414;2u", .insert_newline);
+    try expectEscapeAction("[57414;3u", .insert_newline);
+    try expectEscapeAction("[57419;1u", .cursor_up);
+    try expectEscapeAction("[57420;1u", .cursor_down);
+    try expectEscapeAction("[57417;1u", .cursor_left);
+    try expectEscapeAction("[57418;1u", .cursor_right);
+    try expectEscapeAction("[57423;1u", .home);
+    try expectEscapeAction("[57424;1u", .end);
+    try expectEscapeAction("[57419;2u", moveEscape(.visual_up, true));
+    try expectEscapeAction("[57417;5u", moveEscape(.word_left, false));
+    try expectEscapeAction("[57421u", .page_up);
+    try expectEscapeAction("[57422u", .page_down);
+    try expectEscapeAction("[57426u", .delete_next);
+    try expectEscapeAction("[57426;3u", .delete_word_right);
+    try expectEscapeAction("[57426;5u", .delete_word_right);
+    try expectEscapeAction("[57426;9u", .delete_to_line_end);
+    // Keypad keys with no main-row equivalent stay unmapped.
+    try expectEscapeAction("[57416u", .ignore);
+    try expectEscapeAction("[57425u", .ignore);
+    try expectEscapeAction("[57427u", .ignore);
+}
+
+test "input escape parser resolves keypad keys reported with an event type" {
+    // Ghostty can append the Kitty event type as a colon-qualified modifier.
+    try expectEscapeAction("[57412;1:1u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57412;1:2u", .{ .remapped_byte = '-' });
+    try expectEscapeAction("[57412;1:3u", .ignore);
+    try expectEscapeAction("[57410;1:1u", .{ .remapped_byte = '/' });
+    try expectEscapeAction("[57414;1:1u", .{ .remapped_byte = '\r' });
+    try expectEscapeAction("[57419;1:1u", .cursor_up);
+}
+
 test "input escape parser preserves double escape meta behavior" {
     try expectEscapeAction("\x1b[A", moveEscape(.paragraph_up, false));
     try expectEscapeAction("\x1b[B", moveEscape(.paragraph_down, false));
