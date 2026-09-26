@@ -441,7 +441,20 @@ fn emitTokens(
         .entity => |entity| try out.appendSlice(alloc, entity.utf8[0..entity.len]),
         .code => |content| {
             try out.appendSlice(alloc, ansi.inline_code_open);
-            try out.appendSlice(alloc, content);
+            if (codeSpanUrlEnd(content)) |url_end| {
+                const id = link_id.*;
+                link_id.* +%= 1;
+                var id_buf: [32]u8 = undefined;
+                const open = try std.fmt.bufPrint(&id_buf, "\x1b]8;id=fx-{d};", .{id});
+                try out.appendSlice(alloc, open);
+                try out.appendSlice(alloc, content[0..url_end]);
+                try out.appendSlice(alloc, "\x1b\\");
+                try out.appendSlice(alloc, content[0..url_end]);
+                try out.appendSlice(alloc, "\x1b]8;;\x1b\\");
+                try out.appendSlice(alloc, content[url_end..]);
+            } else {
+                try out.appendSlice(alloc, content);
+            }
             try out.appendSlice(alloc, ansi.inline_code_close);
         },
         .link => |item| try emitInlineLink(alloc, out, item.link, options.restore_underline_after_link, item.visible_prefix, link_id),
@@ -839,6 +852,22 @@ fn isValidAngleAutolinkEmailDomainLabel(label: []const u8) bool {
         }
     }
     return true;
+}
+
+fn codeSpanUrlEnd(content: []const u8) ?usize {
+    const scheme_len: usize = if (std.mem.startsWith(u8, content, "https://"))
+        "https://".len
+    else if (std.mem.startsWith(u8, content, "http://"))
+        "http://".len
+    else
+        return null;
+
+    var end = content.len;
+    // Code spans have no Markdown delimiters, so trailing _, *, and ~ stay in the URL.
+    while (end > scheme_len and tu.isTrailingUrlPunctuation(content[end - 1])) : (end -= 1) {}
+    if (end == scheme_len or !isValidLinkUrl(content[0..end])) return null;
+    for (content) |byte| if (byte <= ' ' or byte == 0x7f) return null;
+    return end;
 }
 
 /// Bare URL starting at `start`, or null. The extent does not depend on any
