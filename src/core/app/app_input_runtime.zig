@@ -1497,10 +1497,7 @@ pub fn Runtime(comptime App: type) type {
                     }
                 },
                 22 => {
-                    // The model picker borrows the composer as its query box,
-                    // and a Ctrl+P flow keeps borrowing it through the inline
-                    // stages: attaching an image there would orphan the payload.
-                    if (modelMenuActive(app) or app.input_runtime.model_picker_draft != null) {
+                    if (paste_rt.modelPickerBorrowsComposer(app)) {
                         debug_trace.logf("input", "image attach skipped reason=model_picker_borrows_composer", .{});
                         return;
                     }
@@ -1541,6 +1538,14 @@ pub fn Runtime(comptime App: type) type {
                         app,
                         resolveExplicitModelSelection(app, app.input_runtime.edit_state.input.items),
                     )) return;
+                    // A Ctrl+P flow's borrowed composer holds only a picker
+                    // query. Submitting it as a prompt or command would act
+                    // on the stashed draft's pending images.
+                    if (app.input_runtime.model_picker_draft != null) {
+                        debug_trace.logf("input", "submit skipped reason=model_picker_borrows_composer", .{});
+                        app.shell.render_requests.request(.footer);
+                        return;
+                    }
                     if (app.input_runtime.lineContinuationState().replaceBackslashBeforeCursorWithNewline(app.alloc)) {
                         app.shell.render_requests.request(.footer);
                         return;
@@ -8905,8 +8910,8 @@ test "app_input_runtime ctrl+p catalog enter offers the effort and fast stages b
 
 test "app_input_runtime ctrl+p inline stages back out to the draft without changing the model" {
     const alloc = std.testing.allocator;
-    const Exit = enum { escape, ctrl_p, clear_line };
-    for ([_]Exit{ .escape, .ctrl_p, .clear_line }) |exit| {
+    const Exit = enum { escape, ctrl_p, clear_line, paste_before_query };
+    for ([_]Exit{ .escape, .ctrl_p, .clear_line, .paste_before_query }) |exit| {
         var app = try RoutingFakeApp.init(alloc);
         defer app.deinit();
         try enterRoutingShortcutEffortStage(&app, "keep me", 2);
@@ -8919,6 +8924,11 @@ test "app_input_runtime ctrl+p inline stages back out to the draft without chang
             },
             .ctrl_p => try feedRoutingBytes(&app, "\x10"),
             .clear_line => try feedRoutingBytes(&app, "\x15"),
+            // The paste completes at the delivery epoch, after ingress.
+            .paste_before_query => {
+                try feedRoutingBytes(&app, "\x01");
+                try feedRoutingBytes(&app, "\x1b[200~x\x1b[201~");
+            },
         }
 
         try std.testing.expect(!app.model_cache.menu.active);
@@ -8929,6 +8939,62 @@ test "app_input_runtime ctrl+p inline stages back out to the draft without chang
         try std.testing.expectEqualStrings("test/model", app.selected_model.items);
         try std.testing.expectEqual(@as(usize, 0), app.preference_commit_count);
     }
+}
+
+test "app_input_runtime ctrl+p model stage never submits the borrowed composer" {
+    const alloc = std.testing.allocator;
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    defer app.clearPendingImages();
+    try app.pending_images.append(alloc, .{
+        .id = 1,
+        .path = try alloc.dupe(u8, "/tmp/image.png"),
+        .media_type = try alloc.dupe(u8, "image/png"),
+    });
+    try enterRoutingShortcutEffortStage(&app, "draft [Image #1]", "draft [Image #1]".len);
+
+    // Left steps back to the inline model stage. Enter on a query that
+    // matches no model must not run it as a `/model` command, which would
+    // clear the stashed draft's pending image.
+    try feedRoutingBytes(&app, "\x1b[D");
+    try feedRoutingBytes(&app, "zz");
+    try Runtime(RoutingFakeApp).handleByte(&app, '\r', 4096, 100);
+
+    try std.testing.expect(app.last_command == null);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expectEqualStrings("/model " ++ routing_staged_model ++ "zz", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.model_picker_draft != null);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
+    try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
+
+    try std.testing.expectEqualStrings("draft [Image #1]", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 1), app.pending_images.items.len);
+    try std.testing.expect(app.input_runtime.model_picker_draft == null);
+}
+
+test "app_input_runtime ctrl+p catalog enter failure restores the draft without later input" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    app.setGatewayControls(routing_staged_model, &routing_staged_efforts, true);
+    try app.input_runtime.textReplacementState().replace(alloc, "fragile draft");
+
+    try feedRoutingBytes(&app, "\x10");
+    try setRoutingModelMenuReady(&app, &.{routing_staged_model});
+    // The selection copy owns the first allocation; fail the stage setup.
+    failing.fail_index = failing.alloc_index + 1;
+
+    // Called directly, so no ingress settle runs after the failure.
+    try std.testing.expectError(
+        error.OutOfMemory,
+        Runtime(RoutingFakeApp).submitModelMenuSelection(&app),
+    );
+
+    try std.testing.expect(!app.model_cache.menu.active);
+    try std.testing.expectEqualStrings("fragile draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.input_runtime.model_picker_draft == null);
 }
 
 test "app_input_runtime ctrl+p toggles the model catalog closed" {
@@ -9083,6 +9149,35 @@ test "app_input_runtime image attach is skipped while ctrl+p inline stages borro
     try std.testing.expectEqualStrings("/model " ++ routing_staged_model ++ " ", app.input_runtime.edit_state.input.items);
     try std.testing.expectEqual(picker_state.ModelPickerStage.effort, app.input_runtime.picker.model_picker_stage);
     try std.testing.expect(app.input_runtime.model_picker_draft != null);
+}
+
+test "app_input_runtime image path paste stays text while ctrl+p inline stages borrow the composer" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeTestImage(&tmp, "staged.png");
+    const image_path = try realTmpPath(alloc, &tmp, "staged.png");
+    defer alloc.free(image_path);
+    const paste = try std.fmt.allocPrint(alloc, "\x1b[200~{s}\x1b[201~", .{image_path});
+    defer alloc.free(paste);
+
+    var app = try RoutingFakeApp.init(alloc);
+    defer app.deinit();
+    defer app.clearPendingImages();
+    try enterRoutingShortcutEffortStage(&app, "draft", "draft".len);
+
+    try feedRoutingBytes(&app, paste);
+
+    // An attachment here would outlive the query once the draft returns.
+    try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    try std.testing.expect(app.input_runtime.model_picker_draft != null);
+
+    try Runtime(RoutingFakeApp).handleByte(&app, 0x1b, 4096, 100);
+    try Runtime(RoutingFakeApp).flushPendingEscape(&app, 0);
+
+    try std.testing.expectEqualStrings("draft", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqual(@as(usize, 0), app.pending_images.items.len);
+    try std.testing.expect(app.input_runtime.model_picker_draft == null);
 }
 
 test "app_input_runtime plain arrows keep history ownership across recalled slash commands" {
