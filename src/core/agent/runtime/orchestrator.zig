@@ -4270,6 +4270,7 @@ fn isContextOverflowFailure(failure: agent_stream_provider.Failure) bool {
         "maximum context length",
         "maximum prompt length",
         "input is too long",
+        "prompt is too long",
         "too many input tokens",
     }) |needle| {
         if (text_utils.containsIgnoreCase(detail, needle)) return true;
@@ -4310,6 +4311,10 @@ test "context overflow recovery is typed safe and bounded" {
         .kind = .invalid_request,
         .detail = @constCast("This model's maximum prompt length is 1000000 but the request contains 1003383 tokens."),
     };
+    const anthropic_prompt_overflow = agent_stream_provider.Failure{
+        .kind = .invalid_request,
+        .detail = @constCast("AI_APICallError: prompt is too long: 1077372 tokens > 1000000 maximum"),
+    };
     const request_too_large = agent_stream_provider.Failure{
         .kind = .request_too_large,
     };
@@ -4323,6 +4328,7 @@ test "context overflow recovery is typed safe and bounded" {
     }{
         .{ .failure = context_failure, .expected = true },
         .{ .failure = grok_prompt_overflow, .expected = true },
+        .{ .failure = anthropic_prompt_overflow, .expected = true },
         .{ .failure = request_too_large, .expected = true },
         .{ .failure = unrelated_failure, .expected = false },
         .{ .failure = context_failure, .has_compactable_context = false, .expected = false },
@@ -5260,30 +5266,6 @@ test "request capabilities resolve before capacity planning and Vision routing" 
     ));
 }
 
-fn request_max_output_tokens(capabilities: model_capabilities.Capabilities) ?u32 {
-    const max_output_tokens = capabilities.max_output_tokens orelse return null;
-    const context_window = capabilities.context_window orelse return max_output_tokens;
-    if (max_output_tokens >= context_window) return null;
-    return max_output_tokens;
-}
-
-test "request output limit follows capability bounds" {
-    const cases = [_]struct {
-        capabilities: model_capabilities.Capabilities,
-        expected: ?u32,
-    }{
-        .{ .capabilities = .{}, .expected = null },
-        .{ .capabilities = .{ .max_output_tokens = 32_000 }, .expected = 32_000 },
-        .{ .capabilities = .{ .context_window = 256_000 }, .expected = null },
-        .{ .capabilities = .{ .context_window = 256_000, .max_output_tokens = 32_000 }, .expected = 32_000 },
-        .{ .capabilities = .{ .context_window = 1_048_576, .max_output_tokens = 1_048_576 }, .expected = null },
-        .{ .capabilities = .{ .context_window = 128_000, .max_output_tokens = 256_000 }, .expected = null },
-    };
-    for (cases) |case| {
-        try std.testing.expectEqual(case.expected, request_max_output_tokens(case.capabilities));
-    }
-}
-
 const PreparedSkills = struct {
     catalog: ?*const skill_runtime.BoundedPromptSection = null,
     explicit: ?*const skill_invocation.ExplicitPromptSection = null,
@@ -6219,7 +6201,7 @@ pub fn prepareManualCompactionContinuation(
             },
             .tool_choice = config.first_call_tool_choice,
             .provider_options = provider_options,
-            .max_output_tokens = request_max_output_tokens(capabilities),
+            .max_output_tokens = model_capabilities.requestOutputTokens(capabilities),
             .budget = .{ .cancel_flag = config.cancel_flag },
         },
         .handoff_message_index = projection.current_user_index,
@@ -7408,7 +7390,7 @@ fn processQueuedPromptLoop(
                 .tool_choice = tool_choice,
                 .vision_mode = vision_mode,
                 .provider_options = provider_opts,
-                .max_output_tokens = request_max_output_tokens(request_capabilities),
+                .max_output_tokens = model_capabilities.requestOutputTokens(request_capabilities),
                 .budget = .{ .cancel_flag = config.cancel_flag },
             };
             var prepared_request_body: ?[]const u8 = null;

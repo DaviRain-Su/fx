@@ -3009,7 +3009,8 @@ test "processQueuedPrompt projects bounded output limits into gateway requests" 
         expected_json: ?[]const u8,
     }{
         .{ .context_window = 256_000, .max_output_tokens = 32_000, .expected_json = "\"maxOutputTokens\":32000" },
-        .{ .context_window = 1_048_576, .max_output_tokens = 1_048_576, .expected_json = null },
+        .{ .context_window = 1_048_576, .max_output_tokens = 1_048_576, .expected_json = "\"maxOutputTokens\":32768" },
+        .{ .context_window = 256_000, .max_output_tokens = null, .expected_json = null },
     };
 
     for (cases) |case| {
@@ -3422,46 +3423,50 @@ test "processQueuedPrompt compacts and retries one context overflow" {
         .model = model,
         .capabilities = .{ .context_window = 128_000, .max_output_tokens = 16_384 },
     }};
-    const completions = [_]FakeCompletion{
-        .{
-            .status = .bad_request,
-            .err_body =
-            \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
-            ,
-        },
-        .{ .content = "Retain the completed prior turn and continue from it." },
-        .{ .content = "CONTEXT_OVERFLOW_RECOVERED" },
+    const overflow_bodies = [_][]const u8{
+        \\{"error":{"message":"AI_APICallError: Your input exceeds the context window of this model."}}
+        ,
+        // Anthropic's rejection, as the gateway returns it.
+        \\{"error":{"message":"prompt is too long: 1077372 tokens > 1000000 maximum","type":"AI_APICallError"}}
+        ,
     };
-    var gateway = FakeGateway.init(alloc, &completions);
-    defer gateway.deinit();
-    var hooks = FakeAgentRuntimeDeps.init(alloc);
-    hooks.available_capability_overrides = &available_overrides;
-    defer hooks.deinit();
-    var fixture = PromptFixture{};
-    var job = fixture.job();
-    job.model = @constCast(model);
-    var history = [_]HistoryTurn{.{ .assistant = .{
-        .user = .{ .text = @constCast("CONTEXT_OVERFLOW_PRIOR_USER") },
-        .assistant = @constCast("CONTEXT_OVERFLOW_PRIOR_ASSISTANT"),
-    } }};
-    job.history = &history;
+    for (overflow_bodies) |overflow_body| {
+        const completions = [_]FakeCompletion{
+            .{ .status = .bad_request, .err_body = overflow_body },
+            .{ .content = "Retain the completed prior turn and continue from it." },
+            .{ .content = "CONTEXT_OVERFLOW_RECOVERED" },
+        };
+        var gateway = FakeGateway.init(alloc, &completions);
+        defer gateway.deinit();
+        var hooks = FakeAgentRuntimeDeps.init(alloc);
+        hooks.available_capability_overrides = &available_overrides;
+        defer hooks.deinit();
+        var fixture = PromptFixture{};
+        var job = fixture.job();
+        job.model = @constCast(model);
+        var history = [_]HistoryTurn{.{ .assistant = .{
+            .user = .{ .text = @constCast("CONTEXT_OVERFLOW_PRIOR_USER") },
+            .assistant = @constCast("CONTEXT_OVERFLOW_PRIOR_ASSISTANT"),
+        } }};
+        job.history = &history;
 
-    try runFakePrompt(&gateway, &hooks, fixture.config(), job);
+        try runFakePrompt(&gateway, &hooks, fixture.config(), job);
 
-    try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
-    try expectBodyContains(&gateway, 0, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
-    try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
-    try expectBodyContains(&gateway, 1, "\"tools\":[]");
-    try expectBodyContains(&gateway, 2, "context_handoff");
-    try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
-    try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
-    try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
-    try std.testing.expect(hooks.history_turns.items[1] == .assistant);
-    try std.testing.expectEqualStrings(
-        "CONTEXT_OVERFLOW_RECOVERED",
-        hooks.finish_assistant_text.?,
-    );
-    try std.testing.expect(hooks.http_status == null);
+        try std.testing.expectEqual(@as(usize, 3), gateway.request_bodies.items.len);
+        try expectBodyContains(&gateway, 0, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+        try expectBodyContains(&gateway, 1, "\"toolChoice\":{\"type\":\"none\"}");
+        try expectBodyContains(&gateway, 1, "\"tools\":[]");
+        try expectBodyContains(&gateway, 2, "context_handoff");
+        try expectBodyNotContains(&gateway, 2, "CONTEXT_OVERFLOW_PRIOR_ASSISTANT");
+        try std.testing.expectEqual(@as(usize, 2), hooks.history_turns.items.len);
+        try std.testing.expect(hooks.history_turns.items[0] == .compacted_summary);
+        try std.testing.expect(hooks.history_turns.items[1] == .assistant);
+        try std.testing.expectEqualStrings(
+            "CONTEXT_OVERFLOW_RECOVERED",
+            hooks.finish_assistant_text.?,
+        );
+        try std.testing.expect(hooks.http_status == null);
+    }
 }
 
 test "processQueuedPrompt stops after one context overflow recovery" {

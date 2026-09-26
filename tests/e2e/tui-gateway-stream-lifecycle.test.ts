@@ -1823,10 +1823,10 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
   );
 
   test(
-    "full-window output limit is omitted from the agent request",
+    "full-window output limit is bounded in the agent request",
     async () => {
       const model = "meta/muse-spark-1.2-contributor";
-      const finalText = "Full-window output limit omitted.";
+      const finalText = "Full-window output limit bounded.";
       const { queuedGateway, stderrPath } = await launchRouteRecoveryTui(
         "fx-tui-full-window-output-limit-",
         [fakeGatewayFinalText(finalText)],
@@ -1853,9 +1853,7 @@ describe.skipIf(!tmuxAvailable())("TUI gateway stream lifecycle", () => {
 
       expect(queuedGateway.modelRequests).toHaveLength(1);
       expect(queuedGateway.requests).toHaveLength(1);
-      expect(JSON.parse(queuedGateway.requests[0]!.body)).not.toHaveProperty(
-        "maxOutputTokens",
-      );
+      expect(JSON.parse(queuedGateway.requests[0]!.body).maxOutputTokens).toBe(32_768);
       expect(session!.isAlive()).toBe(true);
       expect(readFileSync(stderrPath, "utf8")).toBe("");
 
