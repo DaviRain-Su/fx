@@ -1574,14 +1574,46 @@ pub fn Runtime(comptime App: type) type {
             }
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
-                .apply_now => |policy| try applyLiveSessionTransition(app, policy),
+                .apply_now => |policy| applyLiveSessionTransition(app, policy) catch |err| {
+                    if (handleScrollbackHandoffError(app, policy, err)) return;
+                    return err;
+                },
                 .cancel_and_defer => beginLiveSessionCancellation(app),
                 .none => {},
                 .apply_pending => unreachable,
             }
         }
 
+        fn handleScrollbackHandoffError(app: *App, policy: BackgroundSessionPolicy, err: anyerror) bool {
+            switch (err) {
+                error.SessionScrollbackHandoffUnavailable,
+                error.SessionScrollbackHandoffIncomplete,
+                => {
+                    app.session_persistence.pending_live_session_policy = policy;
+                    debug_trace.logf("session", "event=live_session_transition_deferred reason=scrollback_handoff err={s}", .{@errorName(err)});
+                    return true;
+                },
+                error.SessionScrollbackHandoffGeometryChanged => {
+                    app.session_persistence.pending_live_session_policy = null;
+                    app.shell.cancelSessionScrollbackHandoff();
+                    debug_trace.logf("session", "event=live_session_transition_cancelled reason=scrollback_handoff_geometry_changed", .{});
+                    if (comptime @hasDecl(App, "writeDomainNotice")) {
+                        app.writeDomainNotice(.{
+                            .topic = "session",
+                            .tone = .warning,
+                            .body = "Session change cancelled after a terminal resize. The session was not reset; retry the command.",
+                        }, true) catch |notice_err| {
+                            debug_trace.logf("session", "event=transition_cancel_notice_dropped err={s}", .{@errorName(notice_err)});
+                        };
+                    }
+                    return true;
+                },
+                else => return false,
+            }
+        }
+
         pub fn settlePendingLiveSessionTransition(app: *App) !void {
+            if (app.session_persistence.pending_live_session_policy == null) return;
             const decision = decideLiveSessionTransition(
                 runtime_profile.allows(App, .cooperative_agent),
                 app.worker.isProcessing(),
@@ -1591,7 +1623,10 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
                 .apply_pending => |policy| {
-                    try applyIdleLiveSessionTransition(app, policy, true);
+                    applyIdleLiveSessionTransition(app, policy, true) catch |err| {
+                        if (handleScrollbackHandoffError(app, policy, err)) return;
+                        return err;
+                    };
                     try installFreshLiveSession(app);
                 },
                 .none => {},

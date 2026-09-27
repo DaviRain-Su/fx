@@ -4311,6 +4311,14 @@ pub const TranscriptRuntime = struct {
     has_committed_frame: bool = false,
     committed_frame_layout: render_engine.frame_layout.CommittedLayoutSnapshot = .{},
     transcript_commit_state: TranscriptCommitState = .invalid,
+    /// A partial scroll may have moved rows into terminal history already.
+    /// No ordinary repaint may run until the remaining rows are committed.
+    pending_session_scrollback_handoff: ?struct {
+        remaining_rows: u16,
+        total_rows: u16,
+        terminal_cols: u16,
+        terminal_rows: u16,
+    } = null,
     publication_projection_invalid: bool = false,
     /// True while the terminal reports zero, unreadable, or too-small
     /// dimensions after the first committed frame. Normal painters stay
@@ -4820,41 +4828,76 @@ pub const TranscriptRuntime = struct {
 
     /// Publishes the committed visible transcript before its session state is discarded.
     /// A failed or partial frame leaves the old transcript owned by the caller.
+    pub fn sessionScrollbackHandoffPending(self: *const TranscriptRuntime) bool {
+        return self.pending_session_scrollback_handoff != null;
+    }
+
+    pub fn cancelSessionScrollbackHandoff(self: *TranscriptRuntime) void {
+        const pending = self.pending_session_scrollback_handoff orelse return;
+        self.pending_session_scrollback_handoff = null;
+        self.resetTranscriptAnchor("session_scrollback_handoff_geometry_changed");
+        self.markTranscriptDirty();
+        self.render_requests.request(.footer);
+        debug_trace.logf("scroll", "session_scrollback_handoff_cancel remaining_rows={d} reason=geometry_changed", .{pending.remaining_rows});
+    }
+
     pub fn commitVisibleTranscriptBeforeFreshSession(
         self: *TranscriptRuntime,
         alloc: Allocator,
         metrics: *Metrics,
     ) !void {
-        if (!self.has_committed_frame) return;
-        const anchor = switch (self.transcript_commit_state) {
-            .stable => |value| value,
-            .invalid, .recovering => return error.SessionScrollbackHandoffUnavailable,
-        };
-        if (anchor.occupied_last_row == 0) return;
+        if (self.pending_session_scrollback_handoff == null) {
+            if (!self.has_committed_frame) return;
+            const anchor = switch (self.transcript_commit_state) {
+                .stable => |value| value,
+                .invalid, .recovering => return error.SessionScrollbackHandoffUnavailable,
+            };
+            if (anchor.occupied_last_row == 0) return;
+            const shadow = self.shadow_vt orelse return error.SessionScrollbackHandoffUnavailable;
+            const previous = self.committed_frame_layout;
+            if (self.terminal_dimensions_invalid or self.terminal_reset_pending or
+                self.pending_resize_observation != null or self.fullTranscriptActive() or
+                previous.layout_id == 0 or previous.layout_id != anchor.layout_id or
+                previous.terminal_cols != self.layout.cols or previous.terminal_rows != self.layout.rows or
+                shadow.cols != self.layout.cols or shadow.rows != self.layout.rows or
+                self.owned_top_row == 0 or self.owned_top_row != previous.owned_top or
+                previous.transcript_area.isEmpty() or
+                anchor.occupied_last_row < self.owned_top_row or
+                anchor.occupied_last_row > previous.transcript_area.bottom or
+                anchor.occupied_last_row > self.layout.rows)
+            {
+                return error.SessionScrollbackHandoffUnavailable;
+            }
+            self.pending_session_scrollback_handoff = .{
+                .remaining_rows = anchor.occupied_last_row,
+                .total_rows = anchor.occupied_last_row,
+                .terminal_cols = self.layout.cols,
+                .terminal_rows = self.layout.rows,
+            };
+        }
+        const pending = self.pending_session_scrollback_handoff.?;
         const shadow = self.shadow_vt orelse return error.SessionScrollbackHandoffUnavailable;
-        const previous = self.committed_frame_layout;
-        if (self.terminal_dimensions_invalid or self.terminal_reset_pending or
-            self.pending_resize_observation != null or self.fullTranscriptActive() or
-            previous.layout_id == 0 or previous.layout_id != anchor.layout_id or
-            previous.terminal_cols != self.layout.cols or previous.terminal_rows != self.layout.rows or
-            shadow.cols != self.layout.cols or shadow.rows != self.layout.rows or
-            self.owned_top_row == 0 or self.owned_top_row != previous.owned_top or
-            previous.transcript_area.isEmpty() or
-            anchor.occupied_last_row < self.owned_top_row or
-            anchor.occupied_last_row > previous.transcript_area.bottom or
-            anchor.occupied_last_row > self.layout.rows)
+        if (pending.terminal_cols != self.layout.cols or pending.terminal_rows != self.layout.rows or
+            shadow.cols != self.layout.cols or shadow.rows != self.layout.rows)
+        {
+            return error.SessionScrollbackHandoffGeometryChanged;
+        }
+        if (self.terminal_dimensions_invalid or self.terminal_reset_pending or self.fullTranscriptActive() or
+            self.owned_top_row == 0 or
+            (pending.remaining_rows > 0 and pending.remaining_rows < self.owned_top_row))
         {
             return error.SessionScrollbackHandoffUnavailable;
         }
-
-        const last_row = anchor.occupied_last_row;
         const terminal_rows = self.layout.rows;
-        const scroll_plan = render_engine.frame_scroll_plan.merge(
-            terminal_rows,
-            self.owned_top_row,
-            self.owned_top_row - 1,
-            @as(u32, last_row - self.owned_top_row + 1),
-        );
+        const scroll_plan = if (pending.remaining_rows > 0)
+            render_engine.frame_scroll_plan.merge(
+                terminal_rows,
+                self.owned_top_row,
+                self.owned_top_row - 1,
+                @as(u32, pending.remaining_rows - self.owned_top_row + 1),
+            )
+        else
+            render_engine.frame_scroll_plan.FrameScrollPlan.none(terminal_rows, self.owned_top_row);
         const empty = render_engine.paint_plan.FrameBand.empty;
         const plan: render_engine.paint_plan.PaintPlan = .{
             .layout = self.layout,
@@ -4889,17 +4932,25 @@ pub const TranscriptRuntime = struct {
             metrics,
             .{ .plan = plan, .body = .none, .scroll_plan = scroll_plan },
         );
-        self.ackPreservedRowReleaseAssumeValid(scroll_plan, result.terminal_scroll_rows_applied());
-        if (!result.is_committed() or !result.scrollCommit(scroll_plan).complete()) {
+        const receipt = result.scrollCommit(scroll_plan);
+        if (receipt.unplanned_terminal_scroll_rows != 0) return error.InvalidFrameScrollPlan;
+        self.ackPreservedRowReleaseAssumeValid(scroll_plan, receipt.accepted_terminal_scroll_rows);
+        self.pending_session_scrollback_handoff.?.remaining_rows -= receipt.accepted_terminal_scroll_rows;
+        if (!result.is_committed() or !receipt.complete()) {
             return error.SessionScrollbackHandoffIncomplete;
         }
+        self.pending_session_scrollback_handoff = null;
         self.committed_frame_layout = render_engine.frame_layout.CommittedLayoutSnapshot.fromPaintPlan(plan);
         self.cursor_row = 1;
         self.cursor_col = 1;
-        debug_trace.logf("scroll", "session_scrollback_handoff rows={d} owned_top={d}", .{ last_row, scroll_plan.prior_owned_top });
+        debug_trace.logf("scroll", "session_scrollback_handoff rows={d} owned_top={d}", .{ pending.total_rows, scroll_plan.prior_owned_top });
     }
 
     pub fn clearTranscript(self: *TranscriptRuntime, alloc: Allocator) void {
+        if (self.pending_session_scrollback_handoff) |pending| {
+            debug_trace.logf("scroll", "session_scrollback_handoff_discard remaining_rows={d} reason=transcript_clear", .{pending.remaining_rows});
+            self.pending_session_scrollback_handoff = null;
+        }
         const pending_resume_bytes = self.releasePendingResumeSource(alloc);
         if (pending_resume_bytes > 0) {
             debug_trace.logf(

@@ -3163,7 +3163,16 @@ const App = struct {
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
         InputAppRuntime.prepareFilePicker(self);
+        if (comptime !host_target.is_wasm) {
+            if (self.shell.sessionScrollbackHandoffPending()) {
+                try SessionAppRuntime.settlePendingLiveSessionTransition(self);
+                if (self.shell.sessionScrollbackHandoffPending()) return;
+            }
+        }
         try self.flushRequestedFrame();
+        if (comptime !host_target.is_wasm) {
+            try SessionAppRuntime.settlePendingLiveSessionTransition(self);
+        }
     }
 
     pub fn admitPendingApprovalResize(self: *App) bool {

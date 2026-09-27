@@ -357,6 +357,62 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "/new waits for a resize before moving the old transcript into scrollback",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-resize-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "resize.fxtape");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+      const banner = `𝒇x v${version} · Run /help for commands`;
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_RECORD: tapePath,
+            FX_RECORD_INPUT: "1",
+            FX_DEBUG_RECORD_SILENT_BANNER: "1",
+          },
+          stderrPath,
+          width: 80,
+          height: 18,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("/status");
+        await session.waitForPane((pane) => pane.includes("agent_step_limit=0"), 5_000);
+        session.sendLiteralImmediate("/new");
+        await session.resizeWindow(78, 18, 0);
+        await Bun.sleep(40);
+        session.sendKeysImmediate(["Enter"]);
+
+        await session.waitForPane(
+          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          10_000,
+        );
+        const history = await session.captureFullScrollback();
+        const oldStatus = history.slice(history.lastIndexOf("* status:"), history.lastIndexOf(banner));
+        expect(oldStatus).toContain("agent_step_limit=0");
+        expect(session.isAlive()).toBe(true);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+        const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
+        expect(replay.frame_count).toBeGreaterThan(0);
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {

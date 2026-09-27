@@ -8313,6 +8313,82 @@ test "fresh session scrollback handoff releases pre-fx rows before the transcrip
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "owned last"));
 }
 
+test "partial fresh session scrollback handoff does not duplicate committed rows" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    var probe = try PhysicalHistoryProbe.init(40, 12);
+    defer probe.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old first\nold second\nold third\n", true);
+    try h.renderTranscriptFrame();
+    try capturePhysicalFrame(&h, &probe);
+
+    const PartialSink = struct {
+        file: std.Io.File,
+        writes: usize = 0,
+
+        fn write(ctx: *anyopaque, _: *Metrics, bytes: []const u8) render_engine.terminal_diff.FrameSinkWriteResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.writes += 1;
+            const accepted = if (self.writes == 1)
+                (std.mem.findScalar(u8, bytes, '\n') orelse return .{ .partial = .{ .accepted_bytes = 0, .err = error.TestMissingScroll } }) + 1
+            else
+                bytes.len;
+            self.file.writeStreamingAll(io_mod.getIo(), bytes[0..accepted]) catch |err| {
+                return .{ .partial = .{ .accepted_bytes = 0, .err = err } };
+            };
+            return if (self.writes == 1)
+                .{ .partial = .{ .accepted_bytes = accepted, .err = error.TestPartialFrame } }
+            else
+                .complete;
+        }
+    };
+    var sink = PartialSink{ .file = h.file };
+    h.shell.test_frame_sink = .{ .ctx = &sink, .write_frame = PartialSink.write };
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffIncomplete,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old first"));
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old third") != null);
+
+    try std.testing.expect(h.shell.sessionScrollbackHandoffPending());
+    h.shell.test_frame_sink = null;
+    try h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics);
+    try capturePhysicalFrame(&h, &probe);
+    try std.testing.expect(!h.shell.sessionScrollbackHandoffPending());
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old first"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "old third"));
+}
+
+test "resizing after a partial session handoff cancels without clearing transcript" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old session retained\n", true);
+    try h.renderTranscriptFrame();
+    try h.flush();
+
+    h.shell.pending_session_scrollback_handoff = .{
+        .remaining_rows = 1,
+        .total_rows = 2,
+        .terminal_cols = 40,
+        .terminal_rows = 12,
+    };
+    h.shell.layout.cols = 39;
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffGeometryChanged,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    h.shell.cancelSessionScrollbackHandoff();
+    try std.testing.expect(!h.shell.sessionScrollbackHandoffPending());
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old session retained") != null);
+    try std.testing.expect(h.shell.render_requests.hasReason(.footer));
+}
+
 test "failed fresh session scrollback handoff keeps the old transcript" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 40, 12, 4);
