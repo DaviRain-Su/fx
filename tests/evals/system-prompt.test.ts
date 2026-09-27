@@ -9,6 +9,8 @@ import {
 } from "./eval-helpers";
 
 const TIMEOUT = 120_000;
+// Format evals can spend a tool round inspecting before they answer.
+const FORMAT_TIMEOUT = 180_000;
 let workDir: string | null = null;
 
 afterEach(() => {
@@ -19,7 +21,8 @@ afterEach(() => {
 const TABLE_DELIMITER_ROW = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/m;
 const HEADING = /^#{1,6}\s/m;
 
-// Comment lines inside fenced examples are not headings.
+// fx shows fenced content as a code block, so fenced tables and comment
+// lines are neither rendered tables nor headings.
 function withoutFencedCode(text: string): string {
   return text.replace(/^\s*(```|~~~)[\s\S]*?^\s*\1\s*$/gm, "");
 }
@@ -62,13 +65,13 @@ describe("eval: default system prompt response format", () => {
       workDir = createWorkDir();
       const result = await runEval(
         "Compare TCP, UDP, and QUIC by reliability, ordering, connection setup, and typical use cases.",
-        { cwd: workDir, timeoutSec: 90 },
+        { cwd: workDir, timeoutSec: 150 },
       );
       expect(result.json.exit_code).toBe(0);
-      expect(result.json.output).toMatch(TABLE_DELIMITER_ROW);
+      expect(withoutFencedCode(result.json.output)).toMatch(TABLE_DELIMITER_ROW);
       expect(result.json.output).toContain("QUIC");
     },
-    TIMEOUT,
+    FORMAT_TIMEOUT,
   );
 
   test(
@@ -89,14 +92,14 @@ describe("eval: default system prompt response format", () => {
       }
       const result = await runEval(
         "List every service defined in services/ with its name, port, owner, and language.",
-        { cwd: workDir, timeoutSec: 90 },
+        { cwd: workDir, timeoutSec: 150 },
       );
       expect(result.json.exit_code).toBe(0);
       const output = result.json.output;
-      expect(output).toMatch(TABLE_DELIMITER_ROW);
+      expect(withoutFencedCode(output)).toMatch(TABLE_DELIMITER_ROW);
       for (const service of services) expect(output).toContain(service.name);
     },
-    TIMEOUT,
+    FORMAT_TIMEOUT,
   );
 
   test(
@@ -105,14 +108,14 @@ describe("eval: default system prompt response format", () => {
       workDir = createWorkDir();
       const result = await runEval(
         "What does the -r flag do for cp?",
-        { cwd: workDir, timeoutSec: 60 },
+        { cwd: workDir, timeoutSec: 150 },
       );
       expect(result.json.exit_code).toBe(0);
       const output = result.json.output;
       expect(output.toLowerCase()).toContain("recursive");
-      expect(output).not.toMatch(TABLE_DELIMITER_ROW);
+      expect(withoutFencedCode(output)).not.toMatch(TABLE_DELIMITER_ROW);
       expect(withoutFencedCode(output)).not.toMatch(HEADING);
     },
-    TIMEOUT,
+    FORMAT_TIMEOUT,
   );
 });
