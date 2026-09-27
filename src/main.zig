@@ -3187,7 +3187,7 @@ const App = struct {
         resize_interlock.releaseAffirmative();
     }
 
-    fn admitPendingResizeSignal(self: *App, source: []const u8) bool {
+    pub fn admitPendingResizeSignal(self: *App, source: []const u8) bool {
         return shell_runtime.admitResizeSignal(
             &self.shell,
             &resize_interlock,
@@ -4061,6 +4061,80 @@ test "session reset traces and clears active paste state" {
     const trace = try io_mod.readFileToEnd(alloc, &trace_file, 8192);
     defer alloc.free(trace);
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, trace, "decision prompt paste dropped bytes=4 reason=session_reset"));
+}
+
+test "fresh session resize preflight keeps a pending draft until geometry settles" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    try app.shell.enableShadowVt(alloc);
+    app.shell.has_committed_frame = true;
+    resize_interlock.noteResizeSignal();
+    defer _ = resize_interlock.takeResizePending();
+    app.input_runtime.paste.owner = .decision_prompt;
+    app.input_runtime.paste.decision_bytes = 4;
+
+    try app.newSession();
+
+    try std.testing.expect(!resize_interlock.resizePending());
+    try std.testing.expect(app.shell.render_requests.resizeLifecyclePending());
+    try std.testing.expect(app.session_persistence.pending_live_session_policy != null);
+    try std.testing.expect(app.session_persistence.pending_live_session_policy.? == .carry_forward);
+    try std.testing.expectEqual(paste_framing.Owner.decision_prompt, app.input_runtime.paste.owner);
+    try std.testing.expectEqual(@as(usize, 4), app.input_runtime.paste.decision_bytes);
+}
+
+test "partial session handoff resize cancels the pending transition without exiting" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
+    app.shell.has_committed_frame = true;
+    app.session_persistence.pending_live_session_policy = .carry_forward;
+    app.shell.pending_session_scrollback_handoff = .{
+        .remaining_rows = 1,
+        .total_rows = 2,
+        .terminal_cols = 80,
+        .terminal_rows = 24,
+    };
+    app.shell.layout.cols = 78;
+    app.shell.render_requests.observeResizeSignal(100, 100);
+
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
+
+    try std.testing.expect(app.session_persistence.pending_live_session_policy == null);
+    try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
+    try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "old session retained") != null);
+    try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "Session change cancelled") != null);
+    try std.testing.expect(app.shell.render_requests.hasPending());
 }
 
 test "raw benchmark preflight matches no-arg FX_BENCH presence" {

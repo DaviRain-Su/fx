@@ -8313,6 +8313,25 @@ test "fresh session scrollback handoff releases pre-fx rows before the transcrip
     try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, probe.history.items, "owned last"));
 }
 
+test "fresh session handoff waits for an admitted resize" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc, 40, 12, 4);
+    defer h.deinit();
+    try h.shell.initViewport(&h.metrics, 1);
+    try h.shell.writeTranscript(alloc, &h.metrics, "old session visible\n", true);
+    try h.renderTranscriptFrame();
+    try h.flush();
+    const before = try h.file.length(io_mod.getIo());
+
+    h.shell.render_requests.observeResizeSignal(100, 100);
+    try std.testing.expectError(
+        error.SessionScrollbackHandoffUnavailable,
+        h.shell.commitVisibleTranscriptBeforeFreshSession(alloc, &h.metrics),
+    );
+    try std.testing.expectEqual(before, try h.file.length(io_mod.getIo()));
+    try std.testing.expect(std.mem.find(u8, h.shell.transcript.items, "old session visible") != null);
+}
+
 test "partial fresh session scrollback handoff does not duplicate committed rows" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc, 40, 12, 4);

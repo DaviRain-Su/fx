@@ -387,6 +387,9 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         await session.waitForComposer(10_000);
         await session.sendText("/status");
         await session.waitForPane((pane) => pane.includes("agent_step_limit=0"), 5_000);
+        const before = await session.captureFullScrollback();
+        const expectedStatus = before.slice(before.lastIndexOf("* status:")).split("\n┃")[0]?.trimEnd();
+        expect(expectedStatus).toContain("agent_step_limit=0");
         session.sendLiteralImmediate("/new");
         await session.resizeWindow(78, 18, 0);
         await Bun.sleep(40);
@@ -398,8 +401,18 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
         );
         const history = await session.captureFullScrollback();
         const oldStatus = history.slice(history.lastIndexOf("* status:"), history.lastIndexOf(banner));
-        expect(oldStatus).toContain("agent_step_limit=0");
+        let lastIndex = -1;
+        for (const field of ["* status:", "permission_mode=auto", "workspace=", "history_turns=0", "session_permission_grants=0", "agent_step_limit=0"]) {
+          const index = oldStatus.indexOf(field);
+          expect(index).toBeGreaterThan(lastIndex);
+          lastIndex = index;
+        }
+        expect(oldStatus.replace(/\s+/g, "")).toBe(expectedStatus?.replace(/\s+/g, ""));
+        expect(oldStatus).not.toContain("Commands 1");
+        expect(oldStatus).not.toContain("run /login ·");
         expect(session.isAlive()).toBe(true);
+        await session.sendText("/status");
+        await session.waitForPane((pane) => pane.includes("agent_step_limit=0") && hasEmptyComposer(pane), 5_000);
         expect(readFileSync(stderrPath, "utf8")).toBe("");
         const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
         expect(replay.frame_count).toBeGreaterThan(0);

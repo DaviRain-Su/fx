@@ -1574,14 +1574,36 @@ pub fn Runtime(comptime App: type) type {
             }
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
-                .apply_now => |policy| applyLiveSessionTransition(app, policy) catch |err| {
-                    if (handleScrollbackHandoffError(app, policy, err)) return;
-                    return err;
+                .apply_now => |policy| {
+                    if (!freshSessionResizeReady(app)) {
+                        app.session_persistence.pending_live_session_policy = policy;
+                        debug_trace.logf("session", "event=live_session_transition_deferred reason=resize_pending", .{});
+                        return;
+                    }
+                    applyLiveSessionTransition(app, policy) catch |err| {
+                        if (handleScrollbackHandoffError(app, policy, err)) return;
+                        return err;
+                    };
                 },
                 .cancel_and_defer => beginLiveSessionCancellation(app),
                 .none => {},
                 .apply_pending => unreachable,
             }
+        }
+
+        fn freshSessionResizeReady(app: *App) bool {
+            if (comptime @hasField(@TypeOf(app.shell), "has_committed_frame")) {
+                if (!app.shell.has_committed_frame) return true;
+            }
+            if (comptime @hasDecl(App, "admitPendingResizeSignal")) {
+                _ = app.admitPendingResizeSignal("session_handoff");
+            }
+            if (!shell_runtime.resizeLifecycleIdle(&app.shell)) return false;
+            if (comptime !host_target.is_wasm and @hasField(App, "terminal")) {
+                const actual = app.terminal.queryLayout(app.shell.layout.rows -| app.shell.layout.content_bottom) catch return false;
+                if (actual.cols != app.shell.layout.cols or actual.rows != app.shell.layout.rows) return false;
+            }
+            return true;
         }
 
         fn handleScrollbackHandoffError(app: *App, policy: BackgroundSessionPolicy, err: anyerror) bool {
@@ -1601,7 +1623,7 @@ pub fn Runtime(comptime App: type) type {
                         app.writeDomainNotice(.{
                             .topic = "session",
                             .tone = .warning,
-                            .body = "Session change cancelled after a terminal resize. The session was not reset; retry the command.",
+                            .body = "Session change cancelled after a terminal resize. The session was not reset, but queued work may have been cancelled. Retry the command.",
                         }, true) catch |notice_err| {
                             debug_trace.logf("session", "event=transition_cancel_notice_dropped err={s}", .{@errorName(notice_err)});
                         };
@@ -1623,6 +1645,17 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
                 .apply_pending => |policy| {
+                    if (comptime @hasDecl(@TypeOf(app.shell), "sessionScrollbackHandoffPending")) {
+                        if (app.shell.sessionScrollbackHandoffPending()) {
+                            if (comptime @hasDecl(App, "admitPendingResizeSignal")) {
+                                _ = app.admitPendingResizeSignal("session_handoff");
+                            }
+                            if (!shell_runtime.resizeLifecycleIdle(&app.shell)) {
+                                _ = handleScrollbackHandoffError(app, policy, error.SessionScrollbackHandoffGeometryChanged);
+                                return;
+                            }
+                        }
+                    }
                     applyIdleLiveSessionTransition(app, policy, true) catch |err| {
                         if (handleScrollbackHandoffError(app, policy, err)) return;
                         return err;
@@ -1699,6 +1732,7 @@ pub fn Runtime(comptime App: type) type {
                         if (app.terminal.alternate_screen_owner != .none) return error.SessionScrollbackHandoffUnavailable;
                     }
                 }
+                if (!freshSessionResizeReady(app)) return error.SessionScrollbackHandoffUnavailable;
                 try app.shell.commitVisibleTranscriptBeforeFreshSession(app.alloc, &app.metrics);
             }
             retireLiveSessionCompaction(app);

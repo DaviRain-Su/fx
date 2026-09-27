@@ -4856,7 +4856,8 @@ pub const TranscriptRuntime = struct {
             const shadow = self.shadow_vt orelse return error.SessionScrollbackHandoffUnavailable;
             const previous = self.committed_frame_layout;
             if (self.terminal_dimensions_invalid or self.terminal_reset_pending or
-                self.pending_resize_observation != null or self.fullTranscriptActive() or
+                self.pending_resize_observation != null or self.render_requests.resizeLifecyclePending() or
+                self.render_requests.blocksFrameCommit() or self.fullTranscriptActive() or
                 previous.layout_id == 0 or previous.layout_id != anchor.layout_id or
                 previous.terminal_cols != self.layout.cols or previous.terminal_rows != self.layout.rows or
                 shadow.cols != self.layout.cols or shadow.rows != self.layout.rows or
@@ -4882,8 +4883,9 @@ pub const TranscriptRuntime = struct {
         {
             return error.SessionScrollbackHandoffGeometryChanged;
         }
-        if (self.terminal_dimensions_invalid or self.terminal_reset_pending or self.fullTranscriptActive() or
-            self.owned_top_row == 0 or
+        if (self.terminal_dimensions_invalid or self.terminal_reset_pending or
+            self.render_requests.resizeLifecyclePending() or self.render_requests.blocksFrameCommit() or
+            self.fullTranscriptActive() or self.owned_top_row == 0 or
             (pending.remaining_rows > 0 and pending.remaining_rows < self.owned_top_row))
         {
             return error.SessionScrollbackHandoffUnavailable;
