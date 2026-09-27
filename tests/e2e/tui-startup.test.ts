@@ -297,6 +297,66 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "/new preserves the visible transcript in terminal scrollback",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-scrollback-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tapePath = join(root, "session.fxtape");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+      const banner = `𝒇x v${version} · Run /help for commands`;
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            FX_RECORD: tapePath,
+            FX_RECORD_INPUT: "1",
+            FX_DEBUG_RECORD_SILENT_BANNER: "1",
+          },
+          stderrPath,
+          width: 80,
+          height: 18,
+        });
+        await session.waitForComposer(10_000);
+        for (let i = 0; i < 8; i++) {
+          await session.sendText("/status");
+          await session.waitForComposer(5_000);
+        }
+        const before = await session.captureFullScrollback();
+        const lastStatus = before.slice(before.lastIndexOf("* status:"));
+        expect(lastStatus).toContain("agent_step_limit=0");
+
+        await session.sendText("/new");
+        await session.waitForPane(
+          (pane) => pane.includes(banner) && !pane.includes("model=") && hasEmptyComposer(pane),
+          5_000,
+        );
+        const after = await session.captureFullScrollback();
+        const priorStatus = after.slice(after.lastIndexOf("* status:"), after.lastIndexOf(banner)).trimEnd();
+        expect(priorStatus).toBe(lastStatus.split("\n┃")[0]?.trimEnd());
+        expect(priorStatus).not.toContain("Commands 1");
+        expect(priorStatus).not.toContain("run /login ·");
+        expect(await session.capturePane()).not.toContain("model=");
+        const replay = JSON.parse(execFileSync(FX_BIN, ["replay", tapePath, "--json"], { encoding: "utf8" }));
+        expect(replay.frame_count).toBeGreaterThan(0);
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {

@@ -1591,7 +1591,7 @@ pub fn Runtime(comptime App: type) type {
             app.session_persistence.pending_live_session_policy = decision.pending_policy;
             switch (decision.action) {
                 .apply_pending => |policy| {
-                    applyIdleLiveSessionTransition(app, policy);
+                    try applyIdleLiveSessionTransition(app, policy, true);
                     try installFreshLiveSession(app);
                 },
                 .none => {},
@@ -1603,7 +1603,7 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             background_policy: BackgroundSessionPolicy,
         ) !void {
-            try prepareLiveSessionTransition(app, background_policy);
+            try prepareLiveSessionTransition(app, background_policy, true);
             try installFreshLiveSession(app);
         }
 
@@ -1614,7 +1614,7 @@ pub fn Runtime(comptime App: type) type {
         }
 
         pub fn prepareLiveSessionResume(app: *App) !void {
-            try prepareLiveSessionTransition(app, .stop_forget);
+            try prepareLiveSessionTransition(app, .stop_forget, false);
         }
 
         pub fn finishLiveSessionResume(app: *App) !void {
@@ -1625,10 +1625,11 @@ pub fn Runtime(comptime App: type) type {
         fn prepareLiveSessionTransition(
             app: *App,
             background_policy: BackgroundSessionPolicy,
+            preserve_scrollback: bool,
         ) !void {
             beginLiveSessionCancellation(app);
             app.worker.waitUntilIdle();
-            applyIdleLiveSessionTransition(app, background_policy);
+            try applyIdleLiveSessionTransition(app, background_policy, preserve_scrollback);
         }
 
         fn beginLiveSessionCancellation(app: *App) void {
@@ -1655,7 +1656,16 @@ pub fn Runtime(comptime App: type) type {
         fn applyIdleLiveSessionTransition(
             app: *App,
             background_policy: BackgroundSessionPolicy,
-        ) void {
+            preserve_scrollback: bool,
+        ) !void {
+            if (preserve_scrollback) {
+                if (comptime @hasField(App, "terminal")) {
+                    if (comptime @hasField(@TypeOf(app.terminal), "alternate_screen_owner")) {
+                        if (app.terminal.alternate_screen_owner != .none) return error.SessionScrollbackHandoffUnavailable;
+                    }
+                }
+                try app.shell.commitVisibleTranscriptBeforeFreshSession(app.alloc, &app.metrics);
+            }
             retireLiveSessionCompaction(app);
             clearCachedSessionTitle(app);
             app.worker.discardEvents(std.heap.c_allocator);
