@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { buildEvalProcessEnv, shouldLoadDotEnv } from "./eval-helpers";
+import {
+  buildEvalArgs,
+  buildEvalProcessEnv,
+  shouldLoadDotEnv,
+} from "./eval-helpers";
 
 describe("eval helpers", () => {
   test("passes the selected eval model to fx through FX_MODEL", () => {
@@ -19,6 +23,15 @@ describe("eval helpers", () => {
         process.env.FX_MODEL = previous;
       }
     }
+  });
+
+  test("passes the eval budget to fx --timeout in seconds", () => {
+    const args = buildEvalArgs("hello", 150);
+    const flag = args.indexOf("--timeout");
+
+    expect(flag).toBeGreaterThan(-1);
+    expect(args[flag + 1]).toBe("150");
+    expect(args.at(-1)).toBe("hello");
   });
 
   test("does not load repository dotenv files in a hermetic run", () => {
