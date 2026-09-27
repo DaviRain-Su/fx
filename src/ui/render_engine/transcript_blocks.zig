@@ -1449,8 +1449,11 @@ fn wrapTableCell(alloc: Allocator, cell: []const u8, width: usize, lines: *std.A
         var text = tableCellCut(remaining, width);
         if (!hasTableCellText(text)) {
             // A leading space is a break like any other, not a line of its own.
+            // Skipping from the space itself always consumes input, even when
+            // zero-width units precede it.
             if (remaining[glyph.start] == ' ') {
-                remaining = skipTableCellBreak(remaining, &style, &hyperlink);
+                _ = trackTableCellEscapes(remaining[0..glyph.start], &style, &hyperlink);
+                remaining = skipTableCellBreak(remaining[glyph.start..], &style, &hyperlink);
                 continue;
             }
             text = remaining[0 .. glyph.start + glyph.len];
@@ -4787,13 +4790,41 @@ test "wrapTableCell breaks at the column edge and never emits a blank line" {
     try std.testing.expectEqualStrings("bar", lines.items[1].text);
     try std.testing.expect(!lines.items[1].style.isActive());
 
-    // A code span that starts with a space drops it at the first break.
-    const leading = try std.fmt.allocPrint(alloc, "{s} configuration\x1b[39m", .{shared_theme.current().inline_code_open});
+    // A code span that starts with spaces drops them at the first break and
+    // keeps its style on every line.
+    const leading = try std.fmt.allocPrint(alloc, "{s}  configuration\x1b[39m", .{shared_theme.current().inline_code_open});
     defer alloc.free(leading);
-    for (1..16) |narrow| {
+    try wrapTableCell(alloc, leading, 7, &lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expectEqualStrings("configu", lines.items[0].text);
+    try std.testing.expectEqualStrings("ration\x1b[39m", lines.items[1].text);
+    for (lines.items) |line| try std.testing.expect(line.style.fg == .inline_code);
+    for (1..17) |narrow| {
         try wrapTableCell(alloc, leading, narrow, &lines);
         for (lines.items) |line| try std.testing.expect(hasTableCellText(line.text));
     }
+}
+
+test "wrapTableCell advances past zero-width units at a break" {
+    const alloc = std.testing.allocator;
+    var lines: std.ArrayList(TableCellLine) = .empty;
+    defer lines.deinit(alloc);
+
+    try wrapTableCell(alloc, "foo \u{200B} bar", 3, &lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expectEqualStrings("foo", lines.items[0].text);
+    try std.testing.expectEqualStrings("bar", lines.items[1].text);
+
+    const cells = [_][]const u8{
+        "foo \u{FE0F} bar",
+        "\u{200B} supercalifragilistic",
+        "\u{200E} word and more",
+        "a\u{200B} \u{200B} b",
+    };
+    for (cells) |cell| for (1..12) |width| {
+        try wrapTableCell(alloc, cell, width, &lines);
+        for (lines.items) |line| try std.testing.expect(line.width <= width);
+    };
 }
 
 test "wrapTableCell resets a style it cannot restore before the padding" {
