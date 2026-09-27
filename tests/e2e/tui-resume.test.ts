@@ -764,7 +764,6 @@ test("wrapped semantic rows join descriptions across full-transcript pages", () 
     "",
     "┃ full detail · ctrl+o close · pgup/pgdn …",
     "",
-    "auto · gpt-5",
     "  │           │        │ presentation    │",
     "  ├───────────┼────────┼─────────────────┤",
     "  │ Wide VS15 │ x      │ Wide text       │",
