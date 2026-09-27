@@ -104,7 +104,10 @@ export interface EvalResult {
 }
 
 export interface EvalOptions {
-  /** Wall-clock budget for the whole run, which also caps each shell command. */
+  /**
+   * Wall-clock budget for the whole run. fx is stopped when it runs out, and
+   * the same value is fx's default limit for shell commands.
+   */
   timeoutSec?: number;
   cwd?: string;
   model?: string;
