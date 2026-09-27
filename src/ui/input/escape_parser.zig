@@ -777,7 +777,7 @@ pub fn consumeInputEscapeByteWithMouse(
                 const modifiers = param.* >> 4;
                 const event_type = param.* & 0x0F;
                 resetMouseEscapeDecode(stage, param, param2, mouse);
-                if (event_type == 0 or event_type == 1 or event_type == 2) {
+                if (event_type == 1 or event_type == 2) {
                     return kittyUnicodeKeyAction(keycode, modifiers, meta_prefixed);
                 }
                 return .ignore;
