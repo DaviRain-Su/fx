@@ -294,6 +294,9 @@ pub const PromptRunResult = struct {
     exit_code: u8,
     assistant_output: []u8,
     final_output: []u8 = &.{},
+    /// Owned raw text of the completed final response with its Markdown
+    /// intact; empty when absent. `final_output` holds its display form.
+    final_source: []u8 = &.{},
     interrupted: bool = false,
     model: []u8 = &.{},
     session_id: []u8 = &.{},
@@ -311,6 +314,7 @@ pub const PromptRunResult = struct {
     pub fn deinit(self: PromptRunResult, alloc: Allocator) void {
         alloc.free(self.assistant_output);
         if (self.final_output.len > 0) alloc.free(self.final_output);
+        if (self.final_source.len > 0) alloc.free(self.final_source);
         if (self.model.len > 0) alloc.free(self.model);
         if (self.resolved_provider.len > 0) alloc.free(self.resolved_provider);
         if (self.session_id.len > 0) alloc.free(self.session_id);
@@ -619,6 +623,7 @@ const AskContext = struct {
     command_output_line_open: bool = false,
     assistant_output: std.ArrayList(u8) = .empty,
     final_output: std.ArrayList(u8) = .empty,
+    final_source: std.ArrayList(u8) = .empty,
     tool_call_records: std.ArrayList(ToolCallRecord) = .empty,
     tool_call_records_mutex: std.Io.Mutex = .init,
     web_search_progress_mutex: std.Io.Mutex = .init,
@@ -785,6 +790,7 @@ const AskContext = struct {
         }
         self.assistant_output.deinit(self.alloc);
         self.final_output.deinit(self.alloc);
+        self.final_source.deinit(self.alloc);
         for (self.pending_tool_progress.items) |progress| progress.deinit(self.alloc);
         self.pending_tool_progress.deinit(self.alloc);
         for (self.deferred_tool_progress.items) |progress| self.alloc.free(progress);
@@ -2050,6 +2056,11 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
     else
         @constCast(&.{});
     errdefer if (final_output.len > 0) alloc.free(final_output);
+    const final_source: []u8 = if (ctx.final_source.items.len > 0)
+        try alloc.dupe(u8, ctx.final_source.items)
+    else
+        @constCast(&.{});
+    errdefer if (final_source.len > 0) alloc.free(final_source);
     const model = try alloc.dupe(u8, ctx.model);
     errdefer alloc.free(model);
     const resolved_provider: []u8 = if (ctx.resolved_provider) |provider|
@@ -2069,6 +2080,7 @@ fn takePromptRunResult(ctx: *AskContext, alloc: Allocator) !PromptRunResult {
         .exit_code = if (ctx.failed) 1 else 0,
         .assistant_output = assistant_output,
         .final_output = final_output,
+        .final_source = final_source,
         .interrupted = ctx.processInterruptRequested(),
         .model = model,
         .resolved_provider = resolved_provider,
@@ -3212,6 +3224,7 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
         },
         .finish_prompt => |finished| {
             ctx.final_output.clearRetainingCapacity();
+            ctx.final_source.clearRetainingCapacity();
             if (finished.terminal_outcome == .completed) switch (finished.turn) {
                 .assistant => |turn| {
                     const presentation = @import("../agent/runtime/assistant_stream.zig");
@@ -3219,6 +3232,7 @@ fn pushEvent(raw_ctx: *anyopaque, event: WorkerEvent) !void {
                     const normalized = try presentation.normalizeAssistantTextForDisplay(ctx.alloc, text);
                     defer ctx.alloc.free(normalized);
                     try ctx.final_output.appendSlice(ctx.alloc, presentation.textForCompletedPresentation(text, normalized));
+                    try ctx.final_source.appendSlice(ctx.alloc, turn.assistant);
                 },
                 .compacted_summary, .interrupted => {},
             };
@@ -9735,7 +9749,45 @@ test "CLI final output admits only completed assistant finish prompts" {
         const owned = try types.dupeFinishedPrompt(std.heap.c_allocator, source);
         try deps.push_event(deps.ctx, .{ .finish_prompt = owned });
         try std.testing.expectEqual(@as(usize, 0), ctx.final_output.items.len);
+        try std.testing.expectEqual(@as(usize, 0), ctx.final_source.items.len);
     }
+}
+
+test "CLI final source keeps only the completed response with its Markdown" {
+    const alloc = std.testing.allocator;
+    var stdout_capture: TestCapture = .{};
+    defer stdout_capture.deinit(alloc);
+    var stderr_capture: TestCapture = .{};
+    defer stderr_capture.deinit(alloc);
+    var ctx = AskContext.init(
+        alloc,
+        testConfig(),
+        testPromptRunDeps(&stdout_capture, &stderr_capture, testPresentKeyStartup),
+        "/tmp/workspace",
+    );
+    defer ctx.deinit();
+    ctx.output_mode = .json;
+    const deps = agentRuntimeDeps(&ctx);
+
+    const draft = "Add note probe\n\n## Summary\n\n- Uses **bold** and `inline code`.";
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = "Let me check the note first." });
+    try deps.push_text(deps.ctx, .assistant_started);
+    try deps.push_text(deps.ctx, .{ .assistant_source = draft });
+    const finished = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast(draft),
+        } },
+        .terminal_outcome = .completed,
+    });
+    try deps.push_event(deps.ctx, .{ .finish_prompt = finished });
+
+    const result = try takePromptRunResult(&ctx, alloc);
+    defer result.deinit(alloc);
+    try std.testing.expect(std.mem.startsWith(u8, result.assistant_output, "Let me check the note first."));
+    try std.testing.expectEqualStrings(draft, result.final_source);
+    try std.testing.expectEqualStrings("Add note probe\n\n## Summary\n\n- Uses bold and inline code.", result.final_output);
 }
 
 test "CLI command output completion terminates only an open display line" {

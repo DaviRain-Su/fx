@@ -38,7 +38,9 @@ pub fn parseDraft(alloc: Allocator, text: []const u8) !Draft {
     if (trimmed.len == 0) return error.InvalidGithubDraft;
 
     const first_break = std.mem.findScalar(u8, trimmed, '\n') orelse {
-        const title = try alloc.dupe(u8, trimmed);
+        const title_only = plainTitle(trimmed);
+        if (title_only.len == 0) return error.InvalidGithubDraft;
+        const title = try alloc.dupe(u8, title_only);
         errdefer alloc.free(title);
         const body = try alloc.dupe(u8, "");
         return .{
@@ -47,7 +49,7 @@ pub fn parseDraft(alloc: Allocator, text: []const u8) !Draft {
         };
     };
 
-    const title_slice = std.mem.trim(u8, trimmed[0..first_break], " \t\r\n");
+    const title_slice = plainTitle(trimmed[0..first_break]);
     if (title_slice.len == 0) return error.InvalidGithubDraft;
 
     const body_slice = std.mem.trimStart(u8, trimmed[first_break + 1 ..], " \t\r\n");
@@ -58,6 +60,27 @@ pub fn parseDraft(alloc: Allocator, text: []const u8) !Draft {
         .title = title,
         .body = body,
     };
+}
+
+/// Returns the title line without the Markdown that GitHub shows literally in
+/// a title: a leading heading marker and bold wrapping the whole line.
+fn plainTitle(line: []const u8) []const u8 {
+    var title = std.mem.trim(u8, line, " \t\r\n");
+
+    const hashes = std.mem.findNone(u8, title, "#") orelse title.len;
+    if (hashes >= 1 and hashes <= 6 and (hashes == title.len or title[hashes] == ' ' or title[hashes] == '\t')) {
+        title = std.mem.trim(u8, title[hashes..], " \t");
+    }
+
+    for ([_][]const u8{ "**", "__" }) |marker| {
+        if (title.len <= 2 * marker.len) continue;
+        if (!std.mem.startsWith(u8, title, marker) or !std.mem.endsWith(u8, title, marker)) continue;
+        const inner = title[marker.len .. title.len - marker.len];
+        if (std.mem.find(u8, inner, marker) != null) continue;
+        title = std.mem.trim(u8, inner, " \t");
+        break;
+    }
+    return title;
 }
 
 pub fn publish(alloc: Allocator, workflow: Workflow, draft: Draft) !PublishResult {
@@ -163,6 +186,28 @@ test "parse draft trims outer whitespace and preserves body markdown" {
 
     try std.testing.expectEqualStrings("Title with space", draft.title);
     try std.testing.expectEqualStrings("- one\r\n  - two", draft.body);
+}
+
+test "parse draft removes Markdown that GitHub shows literally in a title" {
+    const cases = [_]struct { input: []const u8, title: []const u8, body: []const u8 }{
+        .{ .input = "## Add note probe\n\n## Summary\nbody", .title = "Add note probe", .body = "## Summary\nbody" },
+        .{ .input = "**Add note probe**\n\nbody", .title = "Add note probe", .body = "body" },
+        .{ .input = "# __Add note probe__", .title = "Add note probe", .body = "" },
+        .{ .input = "#123 Keep `code` and **part** bold\n\nbody", .title = "#123 Keep `code` and **part** bold", .body = "body" },
+        .{ .input = "**Bold** and **more**\n\nbody", .title = "**Bold** and **more**", .body = "body" },
+    };
+    for (cases) |case| {
+        const draft = try parseDraft(std.testing.allocator, case.input);
+        defer draft.deinit(std.testing.allocator);
+
+        try std.testing.expectEqualStrings(case.title, draft.title);
+        try std.testing.expectEqualStrings(case.body, draft.body);
+    }
+}
+
+test "parse draft rejects a title that is only Markdown" {
+    try std.testing.expectError(error.InvalidGithubDraft, parseDraft(std.testing.allocator, "##\n\n## Summary\nbody"));
+    try std.testing.expectError(error.InvalidGithubDraft, parseDraft(std.testing.allocator, "#"));
 }
 
 test "publish argv maps pull request workflow" {

@@ -1983,7 +1983,7 @@ fn runGithubWorkflow(
     defer run_result.deinit(alloc);
     if (run_result.exit_code != 0) return .handled_failure;
 
-    const draft = github_publish.parseDraft(alloc, run_result.assistant_output) catch {
+    const draft = github_publish.parseDraft(alloc, run_result.final_source) catch {
         try writeStderr(deps, switch (workflow) {
             .pull_request => "fx pr: failed to parse drafted PR title/body\n",
             .issue => "fx issue: failed to parse drafted issue title/body\n",
