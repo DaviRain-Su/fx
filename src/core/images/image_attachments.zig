@@ -982,18 +982,6 @@ fn downscalePngSnapshot(
     return true;
 }
 
-/// Shrinks an oversized PNG snapshot to the model pixel limit in place.
-/// Returns false when the snapshot is still over the limit, which callers
-/// must not send.
-pub fn fitVerifiedSnapshotToModelLimit(alloc: std.mem.Allocator, verified: *VerifiedSnapshot) std.mem.Allocator.Error!bool {
-    const dimensions = image_data.imageDimensions(verified.bytes) orelse return true;
-    if (!dimensions.exceedsModelLimit()) return true;
-    const smaller = try png_downscale.downscaleOversized(alloc, verified.media_type, verified.bytes) orelse return false;
-    alloc.free(verified.bytes);
-    verified.bytes = smaller.png;
-    return true;
-}
-
 /// Pixel sizes of attachment snapshots already read, keyed by snapshot
 /// digest. Snapshot contents never change, so each is read once while the
 /// cache lives. Keys are owned by the allocator passed alongside the cache.
@@ -3737,26 +3725,6 @@ test "requests find a JPEG frame header behind large metadata" {
 
     try std.testing.expectEqualSlices(usize, &.{1}, projection.withheld_ids);
     try std.testing.expect(std.mem.startsWith(u8, projection.messages[0].content.?, "[Image #1 not sent: image/jpeg is 4032x3024 pixels"));
-}
-
-test "verified snapshots shrink oversized PNGs and refuse other oversized images" {
-    const alloc = std.testing.allocator;
-    const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
-    var shrunk: VerifiedSnapshot = .{ .bytes = png, .media_type = "image/png" };
-    defer shrunk.deinit(alloc);
-    try std.testing.expect(try fitVerifiedSnapshotToModelLimit(alloc, &shrunk));
-    try std.testing.expectEqual(
-        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
-        image_data.imageDimensions(shrunk.bytes),
-    );
-
-    var jpeg: VerifiedSnapshot = .{ .bytes = try alloc.dupe(u8, &image_data.testJpeg(3420, 2224)), .media_type = "image/jpeg" };
-    defer jpeg.deinit(alloc);
-    try std.testing.expect(!try fitVerifiedSnapshotToModelLimit(alloc, &jpeg));
-
-    var small: VerifiedSnapshot = .{ .bytes = try alloc.dupe(u8, &image_data.testJpeg(640, 480)), .media_type = "image/jpeg" };
-    defer small.deinit(alloc);
-    try std.testing.expect(try fitVerifiedSnapshotToModelLimit(alloc, &small));
 }
 
 test "in-memory capture downscales an oversized PNG and keeps other formats" {
