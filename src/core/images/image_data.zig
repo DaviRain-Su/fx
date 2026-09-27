@@ -102,10 +102,12 @@ fn detectFormat(bytes: []const u8) ?ImageFormat {
     return null;
 }
 
-/// Longest side, in pixels, of any image fx sends to a model. Gateway provider
+/// Longest side, in pixels, of any image in a chat request. Gateway provider
 /// routes reject larger images once a request carries many images (2000 on the
 /// strictest routes, 2576 on others). Images stay in conversation history, so
-/// one conservative bound keeps every later request valid.
+/// one conservative bound keeps every later request valid. The vision tool
+/// route sends at most a few images and keeps none, so it does not apply this
+/// bound.
 pub const max_image_dimension: u32 = 2000;
 
 pub const Dimensions = struct {
@@ -340,6 +342,23 @@ pub fn testJpeg(width: u16, height: u16) [test_jpeg_template.len]u8 {
     return bytes;
 }
 
+/// Test fixture: a JPEG whose frame header follows six maximum-size APP1
+/// segments, beyond the first 256 KiB of the file. The caller owns the result.
+pub fn testJpegBehindMetadata(alloc: Allocator, width: u16, height: u16) ![]u8 {
+    const segment_count = 6;
+    const segment_len: usize = 2 + 65535;
+    const frame = testJpeg(width, height);
+    const bytes = try alloc.alloc(u8, 2 + segment_count * segment_len + frame.len - 2);
+    @memcpy(bytes[0..2], "\xff\xd8");
+    for (0..segment_count) |index| {
+        const segment = bytes[2 + index * segment_len ..][0..segment_len];
+        @memset(segment, 0);
+        @memcpy(segment[0..4], "\xff\xe1\xff\xff");
+    }
+    @memcpy(bytes[2 + segment_count * segment_len ..], frame[2..]);
+    return bytes;
+}
+
 fn testGif(width: u16, height: u16) [10]u8 {
     var bytes: [10]u8 = undefined;
     @memcpy(bytes[0..6], "GIF89a");
@@ -472,18 +491,8 @@ fn readTestBytesAt(context: *const anyopaque, offset: u64, buffer: []u8) []const
 
 test "positional dimensions find a JPEG frame header behind large metadata" {
     const alloc = std.testing.allocator;
-    const segment_count = 6;
-    const segment_len: usize = 2 + 65535;
-    const frame = testJpeg(4032, 3024);
-    const bytes = try alloc.alloc(u8, 2 + segment_count * segment_len + frame.len - 2);
+    const bytes = try testJpegBehindMetadata(alloc, 4032, 3024);
     defer alloc.free(bytes);
-    @memcpy(bytes[0..2], "\xff\xd8");
-    for (0..segment_count) |index| {
-        const segment = bytes[2 + index * segment_len ..][0..segment_len];
-        @memset(segment, 0);
-        @memcpy(segment[0..4], "\xff\xe1\xff\xff");
-    }
-    @memcpy(bytes[2 + segment_count * segment_len ..], frame[2..]);
     const slice: []const u8 = bytes;
     const reader: PositionalReader = .{ .context = @ptrCast(&slice), .read_at = readTestBytesAt };
 

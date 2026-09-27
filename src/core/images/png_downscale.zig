@@ -16,7 +16,7 @@ const max_source_pixels: u64 = 8000 * 8000;
 
 const png_signature = "\x89PNG\r\n\x1a\n";
 
-pub const Error = Allocator.Error || error{ InvalidPng, UnsupportedPng };
+const Error = Allocator.Error || error{ InvalidPng, UnsupportedPng };
 
 /// Whether `downscale` accepts images of `media_type`.
 pub fn supportsMediaType(media_type: []const u8) bool {
@@ -50,7 +50,7 @@ pub const Downscaled = struct {
 /// Returns a copy of `png` scaled down, preserving aspect ratio, so neither
 /// side exceeds `max_side`. Malformed input returns `error.InvalidPng`;
 /// interlaced or oversized input returns `error.UnsupportedPng`.
-pub fn downscale(alloc: Allocator, png: []const u8, max_side: u32) Error!Downscaled {
+fn downscale(alloc: Allocator, png: []const u8, max_side: u32) Error!Downscaled {
     std.debug.assert(max_side > 0);
     const parsed = try parse(alloc, png);
     defer alloc.free(parsed.idat);
@@ -541,7 +541,6 @@ fn testEncode(alloc: Allocator, width: u32, height: u32, color_type: ColorType, 
     return out.toOwnedSlice();
 }
 
-/// Test helper for callers of `downscale`: a decodable solid 8-bit gray PNG.
 /// Test fixture: `png` with a zero-filled ancillary chunk of `padding_len`
 /// bytes after IHDR, which adds bytes without changing its pixels.
 pub fn testPaddedPng(alloc: Allocator, png: []const u8, padding_len: u32) ![]u8 {
@@ -555,10 +554,30 @@ pub fn testPaddedPng(alloc: Allocator, png: []const u8, padding_len: u32) ![]u8 
     return padded;
 }
 
+/// Test fixture: a decodable solid 8-bit gray PNG.
 pub fn testSolidGrayPng(alloc: Allocator, width: u32, height: u32, value: u8) ![]u8 {
     const scanlines = try testSolidScanlines(alloc, width, height, &.{value});
     defer alloc.free(scanlines);
     return testEncode(alloc, width, height, .gray, 8, scanlines, &.{});
+}
+
+/// Test fixture: an 8-bit palette PNG of random pixels. Its downscaled copy
+/// stores each pixel as three RGB bytes instead of one palette index, so the
+/// copy is larger than the source.
+pub fn testRandomPalettePng(alloc: Allocator, width: u32, height: u32) ![]u8 {
+    var prng = std.Random.DefaultPrng.init(0x2000);
+    const random = prng.random();
+    var palette: [256 * 3]u8 = undefined;
+    random.bytes(&palette);
+    const row_len = 1 + @as(usize, width);
+    const scanlines = try alloc.alloc(u8, row_len * height);
+    defer alloc.free(scanlines);
+    for (0..height) |y| {
+        const row = scanlines[y * row_len ..][0..row_len];
+        row[0] = 0;
+        random.bytes(row[1..]);
+    }
+    return testEncode(alloc, width, height, .palette, 8, scanlines, &.{.{ "PLTE", &palette }});
 }
 
 /// Builds unfiltered scanlines of a solid 8-bit image.

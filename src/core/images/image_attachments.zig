@@ -295,6 +295,7 @@ pub const CaptureBudget = struct {
     cancel_flag: ?*std.atomic.Value(bool) = null,
     deadline: ?std.Io.Clock.Timestamp = null,
     test_hook: if (builtin.is_test) ?TestBudgetHook else void = if (builtin.is_test) null else {},
+    test_resizer: if (builtin.is_test) ?TestResizer else void = if (builtin.is_test) null else {},
 
     pub fn check(self: CaptureBudget) !void {
         if (comptime builtin.is_test) {
@@ -366,6 +367,13 @@ pub fn captureImageAttachmentsForAdmission(
 const TestBudgetHook = struct {
     ctx: *anyopaque,
     check: *const fn (*anyopaque) anyerror!void,
+};
+
+/// Replaces the platform resizer in tests with a shell script that receives
+/// the source and output paths as `$1` and `$2`.
+const TestResizer = struct {
+    script: []const u8,
+    timeout: std.Io.Clock.Duration = image_normalization_timeout,
 };
 
 pub fn captureImageSnapshot(
@@ -762,32 +770,16 @@ fn captureImageSnapshotFromOpenFileWithBudget(
         );
         defer alloc.free(candidate_temp_path);
 
-        const shrunk = shrink_in_process and try downscalePngSnapshot(
+        var candidate_metadata: ?SnapshotMetadata = null;
+        if (shrink_in_process and try downscalePngSnapshot(
             alloc,
             snapshot_dir_handle,
             source_temp_name,
             source_metadata.size_bytes,
             candidate_temp_name.?,
             budget,
-        );
-        var converted = shrunk;
-        if (!shrunk and can_normalize) {
-            if (prepareImageCandidate(source_temp_path, candidate_temp_path, budget)) |_| {
-                converted = true;
-            } else |err| switch (err) {
-                error.FileNotFound, error.ImagePreparationFailed => {
-                    if (over_bytes) return error.ImagePreparationFailed;
-                    debug_trace.logf("images", "event=image_normalizer_failed reason={s} fallback=keep_source", .{@errorName(err)});
-                },
-                else => return err,
-            }
-        }
-        if (!converted and over_bytes) return error.ImagePreparationFailed;
-        // A source that could not be converted keeps its bytes when it fits
-        // the byte limit, and request building withholds it with a note. The
-        // unused candidate file is deleted on return.
-        if (converted) {
-            metadata = try inspectImageCandidate(
+        )) {
+            candidate_metadata = try inspectImageCandidate(
                 snapshot_dir_handle,
                 candidate_temp_name.?,
                 budget,
@@ -795,7 +787,30 @@ fn captureImageSnapshotFromOpenFileWithBudget(
             if (try snapshotExceedsModelDimensions(snapshot_dir_handle, candidate_temp_name.?, budget)) {
                 return error.ImagePreparationFailed;
             }
+        } else if (can_normalize) {
+            switch (try resizeWithPlatformTool(
+                snapshot_dir_handle,
+                source_temp_path,
+                candidate_temp_name.?,
+                candidate_temp_path,
+                budget,
+            )) {
+                .resized => |resized| candidate_metadata = resized,
+                .failed => |reason| debug_trace.logf(
+                    "images",
+                    "event=image_normalizer_failed reason={s} fallback={s}",
+                    .{ reason, if (over_bytes) "reject" else "keep_source" },
+                ),
+            }
+        }
+        // A source that could not be converted keeps its bytes when it fits
+        // the byte limit, and request building withholds it with a note. The
+        // unused candidate file is deleted on return.
+        if (candidate_metadata) |candidate| {
+            metadata = candidate;
             selected_temp_name = candidate_temp_name.?;
+        } else if (over_bytes) {
+            return error.ImagePreparationFailed;
         }
     }
 
@@ -1187,9 +1202,12 @@ fn waitForImageNormalizer(
     };
 }
 
+/// Runs a resizer process until it exits, `timeout` passes, or the budget's
+/// deadline passes when it has one.
 fn runImageNormalizerProcess(
     argv: []const []const u8,
     budget: CaptureBudget,
+    timeout: std.Io.Clock.Duration,
 ) !void {
     try budget.check();
     var child = try std.process.spawn(io_mod.getIo(), .{
@@ -1201,7 +1219,7 @@ fn runImageNormalizerProcess(
     defer child.kill(io_mod.getIo());
 
     const deadline = budget.deadline orelse
-        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), image_normalization_timeout);
+        std.Io.Clock.Timestamp.fromNow(io_mod.getIo(), timeout);
     const term = try waitForImageNormalizer(&child, deadline, budget.cancel_flag);
     switch (term) {
         .exited => |code| if (code != 0) return error.ImagePreparationFailed,
@@ -1209,11 +1227,52 @@ fn runImageNormalizerProcess(
     }
 }
 
+const ResizeResult = union(enum) {
+    resized: SnapshotMetadata,
+    /// Why the resizer output cannot be used, for the trace log.
+    failed: []const u8,
+};
+
+/// Runs the platform resizer on the source and checks its output. A resizer
+/// failure, its own time limit, and output that cannot be sent are reported
+/// as `.failed`, so the caller decides whether to keep or reject the source.
+/// Cancellation and an expired capture deadline are returned as errors.
+fn resizeWithPlatformTool(
+    snapshot_dir: std.Io.Dir,
+    source_path: []const u8,
+    candidate_name: []const u8,
+    candidate_path: []const u8,
+    budget: CaptureBudget,
+) !ResizeResult {
+    prepareImageCandidate(source_path, candidate_path, budget) catch |err| switch (err) {
+        error.FileNotFound, error.ImagePreparationFailed => return .{ .failed = @errorName(err) },
+        error.TimedOut => {
+            try budget.check();
+            return .{ .failed = "resizer_timeout" };
+        },
+        else => return err,
+    };
+    const metadata = inspectImageCandidate(snapshot_dir, candidate_name, budget) catch |err| switch (err) {
+        error.ImagePreparationFailed => return .{ .failed = "unusable_output" },
+        else => return err,
+    };
+    if (try snapshotExceedsModelDimensions(snapshot_dir, candidate_name, budget)) {
+        return .{ .failed = "output_over_pixel_limit" };
+    }
+    return .{ .resized = metadata };
+}
+
 fn prepareImageCandidate(
     source_path: []const u8,
     candidate_path: []const u8,
     budget: CaptureBudget,
 ) !void {
+    if (comptime builtin.is_test) {
+        if (budget.test_resizer) |resizer| {
+            const argv = [_][]const u8{ "/bin/sh", "-c", resizer.script, "resizer", source_path, candidate_path };
+            return runImageNormalizerProcess(&argv, budget, resizer.timeout);
+        }
+    }
     const argv = [_][]const u8{
         "/usr/bin/sips",
         "-s",
@@ -1228,7 +1287,7 @@ fn prepareImageCandidate(
         "--out",
         candidate_path,
     };
-    try runImageNormalizerProcess(&argv, budget);
+    try runImageNormalizerProcess(&argv, budget, image_normalization_timeout);
 }
 
 fn inspectImageCandidate(
@@ -3231,18 +3290,18 @@ test "image normalizer process requires success and preserves operational errors
     if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
 
     const success_argv = [_][]const u8{ "/bin/sh", "-c", "exit 0" };
-    try runImageNormalizerProcess(&success_argv, .{});
+    try runImageNormalizerProcess(&success_argv, .{}, image_normalization_timeout);
 
     const failure_argv = [_][]const u8{ "/bin/sh", "-c", "exit 7" };
     try std.testing.expectError(
         error.ImagePreparationFailed,
-        runImageNormalizerProcess(&failure_argv, .{}),
+        runImageNormalizerProcess(&failure_argv, .{}, image_normalization_timeout),
     );
 
     const signaled_argv = [_][]const u8{ "/bin/sh", "-c", "kill -TERM $$" };
     try std.testing.expectError(
         error.ImagePreparationFailed,
-        runImageNormalizerProcess(&signaled_argv, .{}),
+        runImageNormalizerProcess(&signaled_argv, .{}, image_normalization_timeout),
     );
 
     const sleeping_argv = [_][]const u8{ "/bin/sh", "-c", "sleep 10" };
@@ -3253,13 +3312,17 @@ test "image normalizer process requires success and preserves operational errors
                 .clock = .awake,
                 .raw = .fromMilliseconds(10),
             }),
-        }),
+        }, image_normalization_timeout),
+    );
+    try std.testing.expectError(
+        error.TimedOut,
+        runImageNormalizerProcess(&sleeping_argv, .{}, .{ .clock = .awake, .raw = .fromMilliseconds(10) }),
     );
 
     var cancelled = std.atomic.Value(bool).init(true);
     try std.testing.expectError(
         error.Cancelled,
-        runImageNormalizerProcess(&sleeping_argv, .{ .cancel_flag = &cancelled }),
+        runImageNormalizerProcess(&sleeping_argv, .{ .cancel_flag = &cancelled }, image_normalization_timeout),
     );
 }
 
@@ -3668,6 +3731,121 @@ test "capture never rejects an image that is only over the pixel limit" {
     try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
 }
 
+/// Platform resizers that fail, stop at their own time limit, write output
+/// that is not an image, or write output still over the pixel limit.
+const failing_test_resizers = [_]TestResizer{
+    .{ .script = "exit 1" },
+    .{ .script = "sleep 5", .timeout = .{ .clock = .awake, .raw = .fromMilliseconds(50) } },
+    .{ .script = "printf unusable > \"$2\"" },
+    .{ .script = "cp \"$1\" \"$2\"" },
+};
+
+test "capture keeps an image only over the pixel limit when the platform resizer fails" {
+    if (comptime builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    const jpeg = image_data.testJpeg(3420, 2224);
+    for (failing_test_resizers) |resizer| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var attachment = try testCaptureFile(alloc, &tmp, "frame.jpg", &jpeg, "image/jpeg");
+        defer types.freeImageAttachment(alloc, attachment);
+        const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+        defer alloc.free(snapshot_dir);
+
+        try captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{ .test_resizer = resizer });
+
+        var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+        defer verified.deinit(alloc);
+        try std.testing.expectEqualSlices(u8, &jpeg, verified.bytes);
+        try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+    }
+}
+
+test "capture rejects an image over the byte limit when the platform resizer fails" {
+    if (comptime builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    const frame = image_data.testJpeg(3420, 2224);
+    const jpeg = try alloc.alloc(u8, (max_encoded_image_bytes / 4) * 3 + 1);
+    defer alloc.free(jpeg);
+    @memset(jpeg, 0);
+    @memcpy(jpeg[0..frame.len], &frame);
+    for (failing_test_resizers) |resizer| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var attachment = try testCaptureFile(alloc, &tmp, "large.jpg", jpeg, "image/jpeg");
+        defer types.freeImageAttachment(alloc, attachment);
+        const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+        defer alloc.free(snapshot_dir);
+
+        try std.testing.expectError(
+            error.ImagePreparationFailed,
+            captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{ .test_resizer = resizer }),
+        );
+        try std.testing.expect(attachment.snapshot_path == null);
+        try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+    }
+}
+
+test "capture fails when its deadline passes while the platform resizer runs" {
+    if (comptime builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const jpeg = image_data.testJpeg(3420, 2224);
+    var attachment = try testCaptureFile(alloc, &tmp, "frame.jpg", &jpeg, "image/jpeg");
+    defer types.freeImageAttachment(alloc, attachment);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+
+    try std.testing.expectError(
+        error.TimedOut,
+        captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{
+            .deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+                .clock = .awake,
+                .raw = .fromMilliseconds(200),
+            }),
+            .test_resizer = .{ .script = "sleep 5" },
+        }),
+    );
+    try std.testing.expect(attachment.snapshot_path == null);
+    try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+}
+
+test "capture keeps the source when its downscaled copy is over the byte limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const png = try png_downscale.testRandomPalettePng(alloc, 2001, 1300);
+    defer alloc.free(png);
+    var attachment = try testCaptureFile(alloc, &tmp, "scattered.png", png, "image/png");
+    defer types.freeImageAttachment(alloc, attachment);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+
+    // A failing platform resizer leaves macOS with the same outcome as
+    // platforms without one.
+    try captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{ .test_resizer = .{ .script = "exit 1" } });
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, png, verified.bytes);
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "in-memory capture keeps the original when its downscaled copy is over the byte limit" {
+    const alloc = std.testing.allocator;
+    const png = try png_downscale.testRandomPalettePng(alloc, 2001, 1300);
+    defer alloc.free(png);
+    try std.testing.expect(fitsEncodedLimit(png.len));
+    const smaller = (try png_downscale.downscaleOversized(alloc, "image/png", png)).?;
+    defer alloc.free(smaller.png);
+    try std.testing.expect(!fitsEncodedLimit(smaller.png.len));
+
+    const attachment = try captureInlineImageBytesInMemory(alloc, 1, "image/png", png);
+    defer types.freeImageAttachment(alloc, attachment);
+    try std.testing.expectEqualSlices(u8, png, attachment.inline_data.?);
+}
+
 test "inline capture downscales an oversized PNG over the byte limit" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -3702,17 +3880,7 @@ test "requests find a JPEG frame header behind large metadata" {
     const arena = arena_state.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const segment_count = 6;
-    const segment_len: usize = 2 + 65535;
-    const frame = image_data.testJpeg(4032, 3024);
-    const jpeg = try arena.alloc(u8, 2 + segment_count * segment_len + frame.len - 2);
-    @memcpy(jpeg[0..2], "\xff\xd8");
-    for (0..segment_count) |index| {
-        const segment = jpeg[2 + index * segment_len ..][0..segment_len];
-        @memset(segment, 0);
-        @memcpy(segment[0..4], "\xff\xe1\xff\xff");
-    }
-    @memcpy(jpeg[2 + segment_count * segment_len ..], frame[2..]);
+    const jpeg = try image_data.testJpegBehindMetadata(arena, 4032, 3024);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image-1-0000000000000001.bin", .data = jpeg });
     const path = try io_mod.dirRealpathAlloc(arena, tmp.dir, "image-1-0000000000000001.bin");
     const images = [_]types.ImageAttachment{
