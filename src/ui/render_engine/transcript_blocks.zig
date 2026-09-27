@@ -1453,11 +1453,14 @@ fn wrapTableCell(alloc: Allocator, cell: []const u8, width: usize, lines: *std.A
             // zero-width units precede it.
             if (remaining[glyph.start] == ' ') {
                 _ = trackTableCellEscapes(remaining[0..glyph.start], &style, &hyperlink);
-                remaining = skipTableCellBreak(remaining[glyph.start..], &style, &hyperlink);
+                const next = skipTableCellBreak(remaining[glyph.start..], &style, &hyperlink);
+                std.debug.assert(next.len < remaining.len);
+                remaining = next;
                 continue;
             }
             text = remaining[0 .. glyph.start + glyph.len];
         }
+        std.debug.assert(text.len > 0);
         var line: TableCellLine = .{
             .text = text,
             .width = display_width.visibleWidthIgnoringAnsi(text),
@@ -4834,7 +4837,7 @@ test "wrapTableCell resets a style it cannot restore before the padding" {
 
     try wrapTableCell(alloc, "\x1b[48;5;236mfoo bar\x1b[49m", 3, &lines);
     try std.testing.expectEqual(@as(usize, 2), lines.items.len);
-    try std.testing.expect(!lines.items[0].style.isActive());
+    try std.testing.expect(!lines.items[1].style.isActive());
     try std.testing.expect(lines.items[0].close_style);
 }
 

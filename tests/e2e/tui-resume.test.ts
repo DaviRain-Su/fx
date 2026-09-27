@@ -544,17 +544,9 @@ function wrappedSemanticDescription(lines: string[], index: number): string {
   return parts.filter((part) => part !== "").join(" ");
 }
 
-// Replay frames record Ctrl-O pages as they were shown, bottom-up, so a row
-// split across pages may find its continuation in an earlier frame.
 function semanticRowHasDescription(lines: string[], index: number, row: SemanticRow): boolean {
-  if (lines[index]!.includes(row.description)) return true;
-  if (wrappedSemanticDescription(lines, index) === row.description) return true;
-  const first = semanticCells(lines[index]!).at(-1) ?? "";
-  return lines.some((line) => {
-    const cells = semanticCells(line);
-    return cells.length === 3 && cells[0] === "" && cells[1] === "" &&
-      `${first} ${cells[2]}` === row.description;
-  });
+  return lines[index]!.includes(row.description) ||
+    wrappedSemanticDescription(lines, index) === row.description;
 }
 
 function semanticHeaderColumns(lines: string[]): number[][] {
