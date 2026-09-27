@@ -16,6 +16,11 @@ const png_signature = "\x89PNG\r\n\x1a\n";
 
 pub const Error = Allocator.Error || error{ InvalidPng, UnsupportedPng };
 
+/// Whether `downscale` accepts images of `media_type`.
+pub fn supportsMediaType(media_type: []const u8) bool {
+    return std.mem.eql(u8, media_type, "image/png");
+}
+
 pub const Downscaled = struct {
     /// PNG bytes owned by the allocator passed to `downscale`.
     png: []u8,
@@ -667,13 +672,57 @@ test "downscale stays bounded on arbitrary bytes" {
     const alloc = std.testing.allocator;
     const png = try testEncode(alloc, 4, 2, .gray, 8, &.{ 0, 0, 100, 200, 250, 0, 10, 110, 210, 240 }, &.{});
     defer alloc.free(png);
-    try std.testing.fuzz(png, fuzzDownscale, .{ .corpus = &.{png} });
+    const bad_filter = try testEncode(alloc, 4, 2, .gray, 8, &.{ 9, 0, 100, 200, 250, 0, 10, 110, 210, 240 }, &.{});
+    defer alloc.free(bad_filter);
+    const interlaced = try alloc.dupe(u8, png);
+    defer alloc.free(interlaced);
+    interlaced[png_signature.len + 8 + 12] = 1;
+    const huge = try alloc.dupe(u8, png);
+    defer alloc.free(huge);
+    @memset(huge[png_signature.len + 8 ..][0..8], 0xff);
+    // Signature, IHDR, and the start of IDAT, cut mid-stream.
+    const truncated = png[0 .. png.len - 20];
+    try std.testing.fuzz(png, fuzzDownscale, .{ .corpus = &.{ png, bad_filter, interlaced, huge, truncated } });
+}
+
+test "downscale stays bounded on mutated PNGs" {
+    const alloc = std.testing.allocator;
+    const gray = try testEncode(alloc, 4, 2, .gray, 8, &.{ 0, 0, 100, 200, 250, 0, 10, 110, 210, 240 }, &.{});
+    defer alloc.free(gray);
+    const palette = try testEncode(alloc, 3, 2, .palette, 2, &.{ 1, 0b00011011, 4, 0b11100100 }, &.{
+        .{ "PLTE", "\x00\x00\x00\xff\x00\x00\x00\xff\x00\x00\x00\xff" },
+        .{ "tRNS", "\x00\x80" },
+    });
+    defer alloc.free(palette);
+    const rgba = try testEncode(alloc, 2, 2, .rgba, 16, &([_]u8{3} ++ [_]u8{0x40} ** 16 ++ [_]u8{2} ++ [_]u8{0x90} ** 16), &.{});
+    defer alloc.free(rgba);
+    const seeds = [_][]const u8{ gray, palette, rgba };
+    var prng = std.Random.DefaultPrng.init(0x1049);
+    const random = prng.random();
+    var buffer: [256]u8 = undefined;
+    for (seeds) |seed| std.debug.assert(seed.len <= buffer.len);
+    for (0..3000) |round| {
+        const seed = seeds[round % seeds.len];
+        const bytes = buffer[0..seed.len];
+        @memcpy(bytes, seed);
+        // Leave the signature intact so mutations reach chunk parsing and inflate.
+        const flips = 1 + random.uintLessThan(usize, 4);
+        for (0..flips) |_| bytes[png_signature.len + random.uintLessThan(usize, seed.len - png_signature.len)] = random.int(u8);
+        const len = png_signature.len + random.uintAtMost(usize, seed.len - png_signature.len);
+        try fuzzDownscaleBytes(bytes[0..len]);
+    }
 }
 
 fn fuzzDownscale(_: []const u8, smith: *std.testing.Smith) !void {
     var bytes: [2048]u8 = undefined;
     const len: usize = @intCast(smith.slice(&bytes));
-    const result = downscale(std.testing.allocator, bytes[0..len], 2) catch |err| switch (err) {
+    try fuzzDownscaleBytes(bytes[0..len]);
+}
+
+/// Any input either fails as malformed or unsupported, or yields a decodable
+/// PNG within the requested bound.
+fn fuzzDownscaleBytes(bytes: []const u8) !void {
+    const result = downscale(std.testing.allocator, bytes, 2) catch |err| switch (err) {
         error.InvalidPng, error.UnsupportedPng => return,
         error.OutOfMemory => return err,
     };

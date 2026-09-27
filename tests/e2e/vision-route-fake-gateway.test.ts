@@ -1261,6 +1261,10 @@ describe("Vision route fake Gateway", () => {
         expect(body).toContain(
           "[Image #1 not sent: image/jpeg is 4032x3024 pixels, over the 2000-pixel limit per side. It is saved at ",
         );
+        expect(body).toContain("Save a copy at most 2000 pixels per side to a new file ending in .jpg without changing this one, then read the copy.]");
+        expect(result.stderr).toContain(
+          "An attached image is over 2000 pixels per side and fx can't downscale it here, so the model gets its saved file path instead of the image.",
+        );
       } finally {
         gateway.stop();
         rmSync(root.root, { recursive: true, force: true });

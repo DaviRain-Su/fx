@@ -51,6 +51,7 @@ const runtime_tool_contracts = @import("tool_contracts.zig");
 const runtime_gateway_step = @import("gateway_step.zig");
 const runtime_vision_contracts = @import("vision_contracts.zig");
 const image_attachments = @import("../../images/image_attachments.zig");
+const image_data = @import("../../images/image_data.zig");
 const runtime_assistant_stream = @import("assistant_stream.zig");
 const runtime_tool_presentation = @import("tool_presentation.zig");
 const runtime_execution_memory = @import("execution_memory.zig");
@@ -6984,6 +6985,10 @@ fn processQueuedPromptLoop(
         selected_fast_mode;
     var fast_unavailable_notified = false;
     var tool_image_strip_notified = false;
+    var attachment_withheld_notified = false;
+    // Attachment pixel sizes probed during this turn, so each step does not
+    // reread every attachment snapshot. Entries live in the turn arena.
+    var attachment_dimensions: image_attachments.AttachmentDimensionCache = .empty;
     var semantic_attempt: usize = if (selection_changed or restored_budget_exhausted)
         0
     else
@@ -7353,13 +7358,26 @@ fn processQueuedPromptLoop(
                     break;
                 }
             }
-            const materialized_messages = if (request_capabilities.image_input_support == .native)
-                try image_attachments.withholdOversizedAttachments(
+            const materialized_messages = if (request_capabilities.image_input_support == .native) native: {
+                const projection = try image_attachments.withholdOversizedAttachments(
                     overlay_arena,
+                    arena,
+                    &attachment_dimensions,
                     try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages),
-                )
-            else
-                result_request_messages;
+                );
+                // The model is told where withheld attachments are saved; the
+                // user who just attached them hears about it once per turn.
+                if (projection.latest_withheld > 0 and !attachment_withheld_notified) {
+                    attachment_withheld_notified = true;
+                    const limit = image_data.max_image_dimension;
+                    try deps.push_text(deps.ctx, .{ .operational = if (projection.latest_withheld == 1)
+                        std.fmt.comptimePrint("An attached image is over {d} pixels per side and fx can't downscale it here, so the model gets its saved file path instead of the image.", .{limit})
+                    else
+                        std.fmt.comptimePrint("Some attached images are over {d} pixels per side and fx can't downscale them here, so the model gets their saved file paths instead of the images.", .{limit}) });
+                    try deps.push_text(deps.ctx, .{ .operational = "\n" });
+                }
+                break :native projection.messages;
+            } else result_request_messages;
             const image_projection = try runtime_gateway_step.projectToolImageMessages(overlay_arena, materialized_messages, request_capabilities.image_input_support, vision_policy.route == .fallback, config.max_tool_result_bytes);
             const request_messages = try with_replyable_conversation_tail(overlay_arena, image_projection.messages);
             if (request_messages.ptr != image_projection.messages.ptr) {

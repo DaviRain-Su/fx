@@ -117,6 +117,23 @@ pub const Dimensions = struct {
     }
 };
 
+/// Writes the model-visible note for an image downscaled from `original` to
+/// `smaller`, including the factor that maps its coordinates back.
+pub fn writeDownscaledNotice(writer: *std.Io.Writer, original: Dimensions, smaller: Dimensions) std.Io.Writer.Error!void {
+    try writer.print(
+        "[Image downscaled from {d}x{d} to {d}x{d} pixels to fit the {d}-pixel limit per side. Multiply coordinates in this image by {d:.2} to get original pixels.]\n",
+        .{ original.width, original.height, smaller.width, smaller.height, max_image_dimension, coordinateScale(original, smaller) },
+    );
+}
+
+/// Ratio from downscaled to original pixels along the longer side.
+fn coordinateScale(original: Dimensions, smaller: Dimensions) f64 {
+    if (original.width >= original.height) {
+        return @as(f64, @floatFromInt(original.width)) / @as(f64, @floatFromInt(smaller.width));
+    }
+    return @as(f64, @floatFromInt(original.height)) / @as(f64, @floatFromInt(smaller.height));
+}
+
 /// Reads pixel dimensions from a PNG, JPEG, GIF, or WebP header without
 /// decoding pixels. Returns null for unsupported, truncated, or malformed
 /// headers, including a JPEG whose frame header lies beyond `bytes`.
@@ -277,7 +294,9 @@ fn jpegDimensions(source: ImageBytes) ?Dimensions {
     return null;
 }
 
-fn testPngHeader(width: u32, height: u32) [24]u8 {
+/// Test fixture shared by image tests: a PNG signature and IHDR declaring the
+/// size, enough for type and pixel-size checks but not for decoding.
+pub fn testPngHeader(width: u32, height: u32) [24]u8 {
     var bytes: [24]u8 = undefined;
     @memcpy(bytes[0..16], "\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR");
     std.mem.writeInt(u32, bytes[16..20], width, .big);
@@ -295,7 +314,9 @@ const test_jpeg_template = "\xff\xd8" ++
     "\xff\xd9";
 const test_jpeg_frame_offset = 27;
 
-fn testJpeg(width: u16, height: u16) [test_jpeg_template.len]u8 {
+/// Test fixture shared by image tests: a JPEG whose frame header declares the
+/// size, enough for type and pixel-size checks but not for decoding.
+pub fn testJpeg(width: u16, height: u16) [test_jpeg_template.len]u8 {
     var bytes = test_jpeg_template.*;
     std.mem.writeInt(u16, bytes[test_jpeg_frame_offset + 5 ..][0..2], height, .big);
     std.mem.writeInt(u16, bytes[test_jpeg_frame_offset + 7 ..][0..2], width, .big);
@@ -413,8 +434,36 @@ test "image dimension parsing stays bounded on arbitrary bytes" {
             &testGif(1, 1),
             &testWebpExtended(2, 2),
             "\xff\xd8\xff\xff\xff\xff",
+            // JPEG segment length that runs past the input.
+            "\xff\xd8\xff\xe0\xff\xff",
+            // PNG IHDR with a zero length and a maximal size.
+            "\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR\xff\xff\xff\xff\xff\xff\xff\xff",
+            // RIFF header naming WebP with no chunk.
+            "RIFF\x00\x00\x00\x00WEBP",
         },
     });
+}
+
+test "image dimension parsing stays bounded on mutated headers" {
+    const seeds = [_][]const u8{
+        &testPngHeader(3420, 2224),
+        &testJpeg(2001, 1),
+        &testGif(1, 1),
+        &testWebpLossy(2001, 17),
+        &testWebpLossless(3, 5000),
+        &testWebpExtended(5000, 2),
+    };
+    var prng = std.Random.DefaultPrng.init(0x1049);
+    const random = prng.random();
+    var bytes: [64]u8 = undefined;
+    for (0..4000) |round| {
+        const seed = seeds[round % seeds.len];
+        @memcpy(bytes[0..seed.len], seed);
+        const flips = 1 + random.uintLessThan(usize, 4);
+        for (0..flips) |_| bytes[random.uintLessThan(usize, seed.len)] = random.int(u8);
+        const len = random.uintAtMost(usize, seed.len);
+        try expectEncodedAgreesWithRaw(bytes[0..len]);
+    }
 }
 
 fn fuzzImageDimensions(_: void, smith: *std.testing.Smith) !void {
