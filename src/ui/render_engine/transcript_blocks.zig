@@ -992,6 +992,8 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
         floor_total += @min(measure.natural, table_min_column_width);
     }
     if (natural_total <= available) return true;
+    // This is the only reason to stack. A column settles below only while its
+    // natural width fits an even share, so the open floors always fit.
     if (floor_total > available) return false;
 
     // Settle every column that fits on one line within an even share of what
@@ -1018,7 +1020,6 @@ fn fitTableColumnWidths(measures: []const TableColumnMeasure, cols: usize, width
         if (width == table_column_open) word_total += wrappedColumnSpan(measure, false).base;
     }
     const break_words = word_total > available;
-    if (settled_total + openColumnsWidth(measures, widths, break_words, 0) > available) return false;
 
     // Find the largest shared scale that fits. At `high` every open column
     // reaches its target, which overflows `available`, so the answer is lower.
@@ -1431,12 +1432,12 @@ const TableCellLine = struct {
     /// Styles and link still open from earlier lines of the cell.
     style: assistant_pacer.SgrState = .{},
     hyperlink: ?[]const u8 = null,
-    /// Whether styles or a link remain open at the end of the line.
+    /// Whether the line must reset styles or close a link before its padding.
     close_style: bool = false,
     close_hyperlink: bool = false,
 };
 
-/// Splits a rendered cell into lines no wider than `width`, breaking after
+/// Splits a rendered cell into lines no wider than `width`, breaking at
 /// spaces where possible and inside a word only when it cannot fit. Callers
 /// choose widths no narrower than the cell's widest display unit.
 fn wrapTableCell(alloc: Allocator, cell: []const u8, width: usize, lines: *std.ArrayList(TableCellLine)) !void {
@@ -1445,7 +1446,7 @@ fn wrapTableCell(alloc: Allocator, cell: []const u8, width: usize, lines: *std.A
     var hyperlink: ?[]const u8 = null;
     var remaining = cell;
     while (firstCodeGlyph(remaining)) |glyph| {
-        var text = display_width.wrapCutIgnoringAnsi(remaining, width);
+        var text = tableCellCut(remaining, width);
         if (firstCodeGlyph(text) == null) text = remaining[0 .. glyph.start + glyph.len];
         var line: TableCellLine = .{
             .text = text,
@@ -1453,23 +1454,53 @@ fn wrapTableCell(alloc: Allocator, cell: []const u8, width: usize, lines: *std.A
             .style = style,
             .hyperlink = hyperlink,
         };
-        trackTableCellEscapes(text, &style, &hyperlink);
-        line.close_style = style.isActive();
+        const styled = trackTableCellEscapes(text, &style, &hyperlink);
+        line.close_style = styled or style.isActive();
         line.close_hyperlink = hyperlink != null;
         try lines.append(alloc, line);
-        remaining = display_width.trimBreakWhitespace(remaining[text.len..]);
+        remaining = skipTableCellBreak(remaining[text.len..], &style, &hyperlink);
     }
     if (lines.items.len == 0) try lines.append(alloc, .{ .text = "", .width = 0 });
 }
 
-fn trackTableCellEscapes(text: []const u8, style: *assistant_pacer.SgrState, hyperlink: *?[]const u8) void {
+/// Cuts at the last space that fits, or at the width itself when the text
+/// continues with a space there.
+fn tableCellCut(text: []const u8, width: usize) []const u8 {
+    const prefix = display_width.prefixByWidthIgnoringAnsi(text, width);
+    if (prefix.len < text.len and (text[prefix.len] == ' ' or text[prefix.len] == '\t')) return prefix;
+    return display_width.wrapCutIgnoringAnsi(text, width);
+}
+
+/// Drops the spaces at a break. Escapes among them only update the carried
+/// state, which the next line reopens.
+fn skipTableCellBreak(text: []const u8, style: *assistant_pacer.SgrState, hyperlink: *?[]const u8) []const u8 {
+    var index: usize = 0;
+    while (index < text.len) {
+        if (text[index] == ' ' or text[index] == '\t') {
+            index += 1;
+        } else if (text[index] == 0x1b) {
+            const end = display_width.ansiSequenceEnd(text, index);
+            _ = trackTableCellEscapes(text[index..end], style, hyperlink);
+            index = end;
+        } else break;
+    }
+    return text[index..];
+}
+
+/// Returns whether `text` sets SGR state. Lines that do are reset before the
+/// border even when the tracker cannot restore the style they set.
+fn trackTableCellEscapes(text: []const u8, style: *assistant_pacer.SgrState, hyperlink: *?[]const u8) bool {
+    var styled = false;
     var index: usize = 0;
     while (std.mem.findScalarPos(u8, text, index, 0x1b)) |start| {
         const end = display_width.ansiSequenceEnd(text, start);
-        style.apply(text[start..end]);
-        updateNoticeHyperlinkState(text[start..end], hyperlink);
+        const sequence = text[start..end];
+        if (sequence.len > 2 and sequence[1] == '[' and sequence[sequence.len - 1] == 'm') styled = true;
+        style.apply(sequence);
+        updateNoticeHyperlinkState(sequence, hyperlink);
         index = end;
     }
+    return styled;
 }
 
 fn appendTableCellLine(alloc: Allocator, out: *std.ArrayList(u8), line: TableCellLine, header: bool) !void {
@@ -4682,7 +4713,8 @@ test "renderTableForTranscript closes and reopens inline styles across wrapped c
         alloc,
         "| Name | Notes |\n" ++
             "|------|-------|\n" ++
-            "| api | see `alpha beta gamma delta` and [the project documentation](https://example.com/docs) now |\n",
+            "| api | see `alpha beta gamma delta` and [the project documentation](https://example.com/docs) " ++
+            "or [spaced reference](<https://example.com/a b>) now |\n",
     );
     defer table.deinit(alloc);
 
@@ -4709,7 +4741,7 @@ test "renderTableForTranscript closes and reopens inline styles across wrapped c
             for ([_][]const u8{ "alpha", "beta", "gamma", "delta" }) |code_word| {
                 if (std.mem.eql(u8, word, code_word)) try std.testing.expect(style.fg == .inline_code);
             }
-            for ([_][]const u8{ "project", "documentation" }) |link_word| {
+            for ([_][]const u8{ "project", "documentation", "spaced", "reference" }) |link_word| {
                 if (std.mem.eql(u8, word, link_word)) try std.testing.expect(hyperlink != null);
             }
             index = @max(word_end, index + 1);
@@ -4717,6 +4749,27 @@ test "renderTableForTranscript closes and reopens inline styles across wrapped c
         try std.testing.expect(!style.isActive());
         try std.testing.expect(hyperlink == null);
     }
+}
+
+test "wrapTableCell breaks at the column edge and never emits a blank line" {
+    const alloc = std.testing.allocator;
+    var lines: std.ArrayList(TableCellLine) = .empty;
+    defer lines.deinit(alloc);
+
+    try wrapTableCell(alloc, "A very long header that wraps", 11, &lines);
+    try std.testing.expectEqual(@as(usize, 3), lines.items.len);
+    try std.testing.expectEqualStrings("A very long", lines.items[0].text);
+    try std.testing.expectEqualStrings("header that", lines.items[1].text);
+    try std.testing.expectEqualStrings("wraps", lines.items[2].text);
+
+    // A code span ending in a space breaks after its last word.
+    const cell = try std.fmt.allocPrint(alloc, "{s}foo \x1b[39m bar", .{shared_theme.current().inline_code_open});
+    defer alloc.free(cell);
+    try wrapTableCell(alloc, cell, 3, &lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expect(lines.items[0].close_style);
+    try std.testing.expectEqualStrings("bar", lines.items[1].text);
+    try std.testing.expect(!lines.items[1].style.isActive());
 }
 
 test "fitTableColumnWidths keeps short columns whole and gives longer text more room" {
