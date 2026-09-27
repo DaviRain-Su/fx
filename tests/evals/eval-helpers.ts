@@ -228,8 +228,11 @@ export async function runEval(
 
       let timedOut = false;
       const timer = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGKILL");
+        // fx may have exited already with its close event still pending.
+        timedOut =
+          child.exitCode === null &&
+          child.signalCode === null &&
+          child.kill("SIGKILL");
       }, timeoutSec * 1000);
 
       child.on("close", (code: number | null) => {

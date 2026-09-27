@@ -47,15 +47,17 @@ describe("eval helpers", () => {
   test.skipIf(!existsSync(FX_BIN))(
     "stops fx when the eval budget runs out and removes its home",
     async () => {
+      let modelRequests = 0;
       const gateway = Bun.serve({
         port: 0,
         idleTimeout: 0,
         fetch(req) {
-          if (new URL(req.url).pathname === "/v1/models") {
+          if (new URL(req.url).pathname === "/coding-agent/v1/models") {
             return Response.json({
               data: [{ id: "fake/model", type: "language", tags: ["tool-use"] }],
             });
           }
+          if (req.method === "POST") modelRequests += 1;
           return new Promise<Response>(() => {});
         },
       });
@@ -70,7 +72,8 @@ describe("eval helpers", () => {
       );
       Object.assign(process.env, overrides);
       const homesBefore = evalHomes();
-      // Bun does not end a test blocked on a hung child, so bound it here.
+      // Bun's test timeout does not end this test while the gateway holds
+      // the request open, so a runEval that never stops fx fails here.
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<never>((_, reject) => {
         deadlineTimer = setTimeout(
@@ -86,6 +89,7 @@ describe("eval helpers", () => {
             deadline,
           ]),
         ).rejects.toThrow("fx ask did not finish within 1s");
+        expect(modelRequests).toBeGreaterThan(0);
         expect([...evalHomes()].filter((name) => !homesBefore.has(name))).toEqual([]);
       } finally {
         clearTimeout(deadlineTimer);
