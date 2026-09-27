@@ -294,8 +294,9 @@ pub const PromptRunResult = struct {
     exit_code: u8,
     assistant_output: []u8,
     final_output: []u8 = &.{},
-    /// Owned raw text of the completed final response with its Markdown
-    /// intact; empty when absent. `final_output` holds its display form.
+    /// Owned raw text of the completed final response as saved to history,
+    /// with its Markdown intact; empty when absent. Unlike `final_output`, it
+    /// never includes display-only text.
     final_source: []u8 = &.{},
     interrupted: bool = false,
     model: []u8 = &.{},
@@ -9788,6 +9789,18 @@ test "CLI final source keeps only the completed response with its Markdown" {
     try std.testing.expect(std.mem.startsWith(u8, result.assistant_output, "Let me check the note first."));
     try std.testing.expectEqualStrings(draft, result.final_source);
     try std.testing.expectEqualStrings("Add note probe\n\n## Summary\n\n- Uses bold and inline code.", result.final_output);
+
+    const displayed = try types.dupeFinishedPrompt(std.heap.c_allocator, .{
+        .turn = .{ .assistant = .{
+            .user = .{ .text = @constCast("prompt") },
+            .assistant = @constCast(draft),
+        } },
+        .presentation_text = "Earlier candidate.\n\n" ++ draft,
+        .terminal_outcome = .completed,
+    });
+    try deps.push_event(deps.ctx, .{ .finish_prompt = displayed });
+    try std.testing.expectEqualStrings(draft, ctx.final_source.items);
+    try std.testing.expect(std.mem.startsWith(u8, ctx.final_output.items, "Earlier candidate."));
 }
 
 test "CLI command output completion terminates only an open display line" {

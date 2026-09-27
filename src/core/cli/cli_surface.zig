@@ -1983,7 +1983,7 @@ fn runGithubWorkflow(
     defer run_result.deinit(alloc);
     if (run_result.exit_code != 0) return .handled_failure;
 
-    const draft = github_publish.parseDraft(alloc, run_result.final_source) catch {
+    const draft = draftFromRun(alloc, run_result) catch {
         try writeStderr(deps, switch (workflow) {
             .pull_request => "fx pr: failed to parse drafted PR title/body\n",
             .issue => "fx issue: failed to parse drafted issue title/body\n",
@@ -2009,6 +2009,12 @@ fn runGithubWorkflow(
     try writeStdout(deps, published.text);
     try writeStdout(deps, "\n");
     return .handled_success;
+}
+
+/// Parses the draft from the completed final response only, so text the model
+/// wrote before a tool call never becomes the title or body.
+fn draftFromRun(alloc: Allocator, run_result: cli_ask.PromptRunResult) !github_publish.Draft {
+    return github_publish.parseDraft(alloc, run_result.final_source);
 }
 
 fn writeStdout(deps: RunDeps, text: []const u8) !void {
@@ -4633,6 +4639,28 @@ test "parseInteractiveLaunch shares native resume grammar" {
         error.MissingAddDirectoryValue,
         parseInteractiveLaunch(alloc, &.{@constCast("--add-dir")}, command_catalog),
     );
+}
+
+test "workflow drafts come only from the completed final response" {
+    const alloc = std.testing.allocator;
+    const final = "Add greeting constant\n\n## Summary\n\n- Export `greeting` from **greeting.ts**.";
+
+    const draft = try draftFromRun(alloc, .{
+        .exit_code = 0,
+        .assistant_output = @constCast("Let me look at the branch first.\n\n" ++ final),
+        .final_source = @constCast(final),
+    });
+    defer draft.deinit(alloc);
+    try std.testing.expectEqualStrings("Add greeting constant", draft.title);
+    try std.testing.expectEqualStrings("## Summary\n\n- Export `greeting` from **greeting.ts**.", draft.body);
+
+    for ([_][]const u8{ "", "Done." }) |final_source| {
+        try std.testing.expectError(error.InvalidGithubDraft, draftFromRun(alloc, .{
+            .exit_code = 0,
+            .assistant_output = @constCast("Let me look at the branch first."),
+            .final_source = @constCast(final_source),
+        }));
+    }
 }
 
 test "parse workflow args consumes leading flags and joins remaining context exactly" {

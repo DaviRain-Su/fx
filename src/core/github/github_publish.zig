@@ -33,21 +33,11 @@ const CompletedProcess = struct {
     stderr: []u8,
 };
 
+/// Splits a drafted PR or issue into its title line and Markdown body. The
+/// draft prompts always ask for both, so text without a body is not a draft.
 pub fn parseDraft(alloc: Allocator, text: []const u8) !Draft {
     const trimmed = std.mem.trim(u8, text, " \t\r\n");
-    if (trimmed.len == 0) return error.InvalidGithubDraft;
-
-    const first_break = std.mem.findScalar(u8, trimmed, '\n') orelse {
-        const title_only = plainTitle(trimmed);
-        if (title_only.len == 0) return error.InvalidGithubDraft;
-        const title = try alloc.dupe(u8, title_only);
-        errdefer alloc.free(title);
-        const body = try alloc.dupe(u8, "");
-        return .{
-            .title = title,
-            .body = body,
-        };
-    };
+    const first_break = std.mem.findScalar(u8, trimmed, '\n') orelse return error.InvalidGithubDraft;
 
     const title_slice = plainTitle(trimmed[0..first_break]);
     if (title_slice.len == 0) return error.InvalidGithubDraft;
@@ -72,13 +62,10 @@ fn plainTitle(line: []const u8) []const u8 {
         title = std.mem.trim(u8, title[hashes..], " \t");
     }
 
-    for ([_][]const u8{ "**", "__" }) |marker| {
-        if (title.len <= 2 * marker.len) continue;
-        if (!std.mem.startsWith(u8, title, marker) or !std.mem.endsWith(u8, title, marker)) continue;
-        const inner = title[marker.len .. title.len - marker.len];
-        if (std.mem.find(u8, inner, marker) != null) continue;
-        title = std.mem.trim(u8, inner, " \t");
-        break;
+    const bold = "**";
+    if (title.len > 2 * bold.len and std.mem.startsWith(u8, title, bold) and std.mem.endsWith(u8, title, bold)) {
+        const inner = title[bold.len .. title.len - bold.len];
+        if (std.mem.find(u8, inner, bold) == null) title = std.mem.trim(u8, inner, " \t");
     }
     return title;
 }
@@ -169,12 +156,11 @@ test "parse draft rejects whitespace-only input" {
     try std.testing.expectError(error.InvalidGithubDraft, parseDraft(std.testing.allocator, " \n\t "));
 }
 
-test "parse draft accepts title-only input" {
-    const draft = try parseDraft(std.testing.allocator, "Title only");
-    defer draft.deinit(std.testing.allocator);
-
-    try std.testing.expectEqualStrings("Title only", draft.title);
-    try std.testing.expectEqualStrings("", draft.body);
+test "parse draft rejects text without a body" {
+    // "Done." is what fx records when the model's final reply is empty.
+    for ([_][]const u8{ "Title only", "Done.", "Title only \r\n\t " }) |text| {
+        try std.testing.expectError(error.InvalidGithubDraft, parseDraft(std.testing.allocator, text));
+    }
 }
 
 test "parse draft trims outer whitespace and preserves body markdown" {
@@ -192,9 +178,10 @@ test "parse draft removes Markdown that GitHub shows literally in a title" {
     const cases = [_]struct { input: []const u8, title: []const u8, body: []const u8 }{
         .{ .input = "## Add note probe\n\n## Summary\nbody", .title = "Add note probe", .body = "## Summary\nbody" },
         .{ .input = "**Add note probe**\n\nbody", .title = "Add note probe", .body = "body" },
-        .{ .input = "# __Add note probe__", .title = "Add note probe", .body = "" },
+        .{ .input = "# **Add note probe**\n\nbody", .title = "Add note probe", .body = "body" },
         .{ .input = "#123 Keep `code` and **part** bold\n\nbody", .title = "#123 Keep `code` and **part** bold", .body = "body" },
         .{ .input = "**Bold** and **more**\n\nbody", .title = "**Bold** and **more**", .body = "body" },
+        .{ .input = "__init__ runs twice\n\nbody", .title = "__init__ runs twice", .body = "body" },
     };
     for (cases) |case| {
         const draft = try parseDraft(std.testing.allocator, case.input);
@@ -207,7 +194,7 @@ test "parse draft removes Markdown that GitHub shows literally in a title" {
 
 test "parse draft rejects a title that is only Markdown" {
     try std.testing.expectError(error.InvalidGithubDraft, parseDraft(std.testing.allocator, "##\n\n## Summary\nbody"));
-    try std.testing.expectError(error.InvalidGithubDraft, parseDraft(std.testing.allocator, "#"));
+    try std.testing.expectError(error.InvalidGithubDraft, parseDraft(std.testing.allocator, "**  **\n\nbody"));
 }
 
 test "publish argv maps pull request workflow" {
