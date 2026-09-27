@@ -147,9 +147,25 @@ pub fn encodedImageDimensions(encoded: []const u8) ?Dimensions {
     return dimensionsFrom(.{ .base64 = encoded });
 }
 
+/// Reads image bytes on demand from caller-owned storage such as a file.
+/// `read_at` copies bytes starting at `offset` into `buffer` and returns the
+/// copied prefix, which is shorter at the end of the data or on failure.
+pub const PositionalReader = struct {
+    context: *const anyopaque,
+    read_at: *const fn (context: *const anyopaque, offset: u64, buffer: []u8) []const u8,
+};
+
+/// Like `imageDimensions`, but reads only the header bytes it needs, so a
+/// JPEG frame header behind large metadata segments is found without
+/// loading the whole image.
+pub fn positionalImageDimensions(reader: PositionalReader) ?Dimensions {
+    return dimensionsFrom(.{ .positional = reader });
+}
+
 const ImageBytes = union(enum) {
     raw: []const u8,
     base64: []const u8,
+    positional: PositionalReader,
 
     /// Copies decoded bytes starting at `offset` into `buffer` and returns the
     /// copied prefix. The prefix is shorter than `buffer` at the end of the
@@ -163,6 +179,7 @@ const ImageBytes = union(enum) {
                 return buffer[0..count];
             },
             .base64 => |encoded| return readBase64(encoded, offset, buffer),
+            .positional => |reader| return reader.read_at(reader.context, offset, buffer),
         }
     }
 };
@@ -442,6 +459,37 @@ test "image dimension parsing stays bounded on arbitrary bytes" {
             "RIFF\x00\x00\x00\x00WEBP",
         },
     });
+}
+
+fn readTestBytesAt(context: *const anyopaque, offset: u64, buffer: []u8) []const u8 {
+    const bytes: *const []const u8 = @ptrCast(@alignCast(context));
+    if (offset >= bytes.len) return buffer[0..0];
+    const start: usize = @intCast(offset);
+    const count = @min(buffer.len, bytes.len - start);
+    @memcpy(buffer[0..count], bytes.*[start..][0..count]);
+    return buffer[0..count];
+}
+
+test "positional dimensions find a JPEG frame header behind large metadata" {
+    const alloc = std.testing.allocator;
+    const segment_count = 6;
+    const segment_len: usize = 2 + 65535;
+    const frame = testJpeg(4032, 3024);
+    const bytes = try alloc.alloc(u8, 2 + segment_count * segment_len + frame.len - 2);
+    defer alloc.free(bytes);
+    @memcpy(bytes[0..2], "\xff\xd8");
+    for (0..segment_count) |index| {
+        const segment = bytes[2 + index * segment_len ..][0..segment_len];
+        @memset(segment, 0);
+        @memcpy(segment[0..4], "\xff\xe1\xff\xff");
+    }
+    @memcpy(bytes[2 + segment_count * segment_len ..], frame[2..]);
+    const slice: []const u8 = bytes;
+    const reader: PositionalReader = .{ .context = @ptrCast(&slice), .read_at = readTestBytesAt };
+
+    try std.testing.expectEqual(@as(?Dimensions, .{ .width = 4032, .height = 3024 }), positionalImageDimensions(reader));
+    try std.testing.expectEqual(imageDimensions(bytes), positionalImageDimensions(reader));
+    try std.testing.expectEqual(@as(?Dimensions, null), imageDimensions(bytes[0 .. 256 * 1024]));
 }
 
 test "image dimension parsing stays bounded on mutated headers" {

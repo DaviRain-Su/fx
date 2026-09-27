@@ -100,7 +100,7 @@ pub fn executeRequest(
         try images.ensureTotalCapacity(alloc, ids.len);
         try verified_images.ensureTotalCapacity(alloc, ids.len);
         for (ids, pointers) |image_id, image| {
-            const verified = image_attachments.loadVerifiedSnapshot(
+            var verified = image_attachments.loadVerifiedSnapshot(
                 alloc,
                 image.*,
                 .{ .cancel_flag = cancel_flag },
@@ -135,6 +135,28 @@ pub fn executeRequest(
                 },
                 else => return err,
             };
+            // Vision requests follow the same pixel limit as chat requests.
+            const fits = image_attachments.fitVerifiedSnapshotToModelLimit(alloc, &verified) catch |err| {
+                verified.deinit(alloc);
+                return err;
+            };
+            if (!fits) {
+                verified.deinit(alloc);
+                debug_trace.eventf(
+                    "tool",
+                    "vision_image_unavailable",
+                    config.trace_ctx,
+                    "image_id={d} reason=over_pixel_limit",
+                    .{image_id},
+                );
+                try appendBatchFailures(
+                    alloc,
+                    &records,
+                    &.{image_id},
+                    .image_unavailable,
+                );
+                continue;
+            }
             healthy_ids.appendAssumeCapacity(image_id);
             images.appendAssumeCapacity(image.*);
             verified_images.appendAssumeCapacity(verified);

@@ -45,6 +45,13 @@ export function jpegHeader(width: number, height: number): Buffer {
   return header;
 }
 
+// A PNG with a zero-filled ancillary chunk after IHDR, which adds bytes
+// without changing its pixels.
+export function paddedPng(png: Buffer, paddingBytes: number): Buffer {
+  const ihdrEnd = 8 + 25;
+  return Buffer.concat([png.subarray(0, ihdrEnd), pngChunk("zzPd", Buffer.alloc(paddingBytes)), png.subarray(ihdrEnd)]);
+}
+
 // Pixel size of a PNG, read from its header.
 export function pngPixelSize(png: Buffer): { width: number; height: number } {
   assert.ok(png.subarray(0, 8).equals(Buffer.from("89504e470d0a1a0a", "hex")), "expected a PNG");

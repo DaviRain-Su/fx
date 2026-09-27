@@ -3,6 +3,8 @@
 //! proportional to the image width; only the smaller output is materialized.
 
 const std = @import("std");
+const debug_trace = @import("../shared/debug_trace.zig");
+const image_data = @import("image_data.zig");
 const Allocator = std.mem.Allocator;
 const flate = std.compress.flate;
 
@@ -19,6 +21,23 @@ pub const Error = Allocator.Error || error{ InvalidPng, UnsupportedPng };
 /// Whether `downscale` accepts images of `media_type`.
 pub fn supportsMediaType(media_type: []const u8) bool {
     return std.mem.eql(u8, media_type, "image/png");
+}
+
+/// Shrinks `bytes` to the model pixel limit when it is a PNG over that limit.
+/// Returns null for other formats, images within the limit, and PNGs this
+/// decoder cannot handle, so callers can fall back. The result is owned by
+/// `alloc`.
+pub fn downscaleOversized(alloc: Allocator, media_type: []const u8, bytes: []const u8) Allocator.Error!?Downscaled {
+    if (!supportsMediaType(media_type)) return null;
+    const dimensions = image_data.imageDimensions(bytes) orelse return null;
+    if (!dimensions.exceedsModelLimit()) return null;
+    return downscale(alloc, bytes, image_data.max_image_dimension) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidPng, error.UnsupportedPng => {
+            debug_trace.logf("images", "event=png_downscale_skipped reason={s} width={d} height={d}", .{ @errorName(err), dimensions.width, dimensions.height });
+            return null;
+        },
+    };
 }
 
 pub const Downscaled = struct {
@@ -523,6 +542,19 @@ fn testEncode(alloc: Allocator, width: u32, height: u32, color_type: ColorType, 
 }
 
 /// Test helper for callers of `downscale`: a decodable solid 8-bit gray PNG.
+/// Test fixture: `png` with a zero-filled ancillary chunk of `padding_len`
+/// bytes after IHDR, which adds bytes without changing its pixels.
+pub fn testPaddedPng(alloc: Allocator, png: []const u8, padding_len: u32) ![]u8 {
+    const ihdr_end = png_signature.len + 25;
+    const padded = try alloc.alloc(u8, png.len + 12 + padding_len);
+    @memcpy(padded[0..ihdr_end], png[0..ihdr_end]);
+    std.mem.writeInt(u32, padded[ihdr_end..][0..4], padding_len, .big);
+    @memcpy(padded[ihdr_end + 4 ..][0..4], "zzPd");
+    @memset(padded[ihdr_end + 8 ..][0 .. padding_len + 4], 0);
+    @memcpy(padded[ihdr_end + 12 + padding_len ..], png[ihdr_end..]);
+    return padded;
+}
+
 pub fn testSolidGrayPng(alloc: Allocator, width: u32, height: u32, value: u8) ![]u8 {
     const scanlines = try testSolidScanlines(alloc, width, height, &.{value});
     defer alloc.free(scanlines);

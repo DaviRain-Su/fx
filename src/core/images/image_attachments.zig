@@ -556,7 +556,11 @@ pub fn captureInlineImageBytes(
 ) !types.ImageAttachment {
     if (image_id == 0) return error.InvalidImageId;
     if (bytes.len == 0 or declared_media_type.len == 0) return error.UnsupportedImageType;
-    if (bytes.len > max_image_bytes or !fitsEncodedLimit(bytes.len)) return error.ImageTooLarge;
+    if (bytes.len > max_image_bytes) return error.ImageTooLarge;
+    // Only a PNG over the pixel limit can come under the byte limit, by being
+    // downscaled during capture.
+    const over_bytes = !fitsEncodedLimit(bytes.len);
+    if (over_bytes and !pngExceedsModelDimensions(bytes)) return error.ImageTooLarge;
     // Validate the declared type against the caller's bytes: normalization may
     // legitimately change the snapshot's type.
     const detected = detectMediaTypeFromBytes(bytes) orelse return error.UnsupportedImageType;
@@ -598,7 +602,10 @@ pub fn captureInlineImageBytes(
         .media_type = try alloc.dupe(u8, declared_media_type),
     };
     errdefer discardImageAttachment(alloc, attachment);
-    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+    captureImageSnapshot(alloc, &attachment, snapshot_dir) catch |err| switch (err) {
+        error.ImagePreparationFailed => return if (over_bytes) error.ImageTooLarge else err,
+        else => return err,
+    };
 
     const durable_path = try alloc.dupe(
         u8,
@@ -631,7 +638,13 @@ pub fn captureInlineImageBytesInMemory(
     // Without a snapshot directory there is no platform resizer, so only
     // PNGs shrink here; other oversized images are withheld with a note when
     // requests are built.
-    const owned_bytes = try downscaleOversizedPng(alloc, detected, bytes) orelse try alloc.dupe(u8, bytes);
+    const owned_bytes = owned: {
+        if (try png_downscale.downscaleOversized(alloc, detected, bytes)) |smaller| {
+            if (fitsEncodedLimit(smaller.png.len)) break :owned smaller.png;
+            alloc.free(smaller.png);
+        }
+        break :owned try alloc.dupe(u8, bytes);
+    };
     errdefer alloc.free(owned_bytes);
     if (!fitsEncodedLimit(owned_bytes.len)) return error.ImageTooLarge;
     const owned_path = try std.fmt.allocPrint(alloc, inline_image_path_prefix ++ "{d}", .{image_id});
@@ -652,6 +665,13 @@ pub fn captureInlineImageBytesInMemory(
 }
 
 pub const inline_image_path_prefix = "inline://image-";
+
+fn pngExceedsModelDimensions(bytes: []const u8) bool {
+    const media_type = detectMediaTypeFromBytes(bytes) orelse return false;
+    if (!png_downscale.supportsMediaType(media_type)) return false;
+    const dimensions = image_data.imageDimensions(bytes) orelse return false;
+    return dimensions.exceedsModelLimit();
+}
 
 fn captureImageSnapshotFromOpenFileWithBudget(
     alloc: std.mem.Allocator,
@@ -707,7 +727,7 @@ fn captureImageSnapshotFromOpenFileWithBudget(
     // request building to withhold with a note.
     const can_normalize = comptime builtin.os.tag == .macos;
     const over_bytes = !fitsEncodedLimit(source_metadata.size_bytes);
-    const over_pixels = try snapshotExceedsModelDimensions(alloc, snapshot_dir_handle, source_temp_name, budget);
+    const over_pixels = try snapshotExceedsModelDimensions(snapshot_dir_handle, source_temp_name, budget);
     const shrink_in_process = over_pixels and png_downscale.supportsMediaType(source_metadata.media_type);
     if (over_bytes and !can_normalize and !shrink_in_process) return error.ImagePreparationFailed;
     if (over_bytes or shrink_in_process or (over_pixels and can_normalize)) {
@@ -750,23 +770,29 @@ fn captureImageSnapshotFromOpenFileWithBudget(
             candidate_temp_name.?,
             budget,
         );
+        var converted = shrunk;
         if (!shrunk and can_normalize) {
-            prepareImageCandidate(source_temp_path, candidate_temp_path, budget) catch |err| switch (err) {
-                error.FileNotFound => return error.ImagePreparationFailed,
+            if (prepareImageCandidate(source_temp_path, candidate_temp_path, budget)) |_| {
+                converted = true;
+            } else |err| switch (err) {
+                error.FileNotFound, error.ImagePreparationFailed => {
+                    if (over_bytes) return error.ImagePreparationFailed;
+                    debug_trace.logf("images", "event=image_normalizer_failed reason={s} fallback=keep_source", .{@errorName(err)});
+                },
                 else => return err,
-            };
+            }
         }
-        if (!shrunk and !can_normalize and over_bytes) return error.ImagePreparationFailed;
-        // A PNG that cannot shrink in process, with no platform resizer, keeps
-        // its source when it fits the byte limit; the unused candidate is
-        // removed on return.
-        if (shrunk or can_normalize) {
+        if (!converted and over_bytes) return error.ImagePreparationFailed;
+        // A source that could not be converted keeps its bytes when it fits
+        // the byte limit, and request building withholds it with a note. The
+        // unused candidate file is deleted on return.
+        if (converted) {
             metadata = try inspectImageCandidate(
                 snapshot_dir_handle,
                 candidate_temp_name.?,
                 budget,
             );
-            if (try snapshotExceedsModelDimensions(alloc, snapshot_dir_handle, candidate_temp_name.?, budget)) {
+            if (try snapshotExceedsModelDimensions(snapshot_dir_handle, candidate_temp_name.?, budget)) {
                 return error.ImagePreparationFailed;
             }
             selected_temp_name = candidate_temp_name.?;
@@ -880,18 +906,25 @@ const SnapshotMetadata = struct {
     size_bytes: usize,
 };
 
-/// Prefix read when probing pixel dimensions: every fixed-offset header plus
-/// the frame header of a JPEG behind large metadata segments.
-const dimension_probe_bytes = 256 * 1024;
+/// Reads a snapshot file on demand for pixel-size checks, so a JPEG frame
+/// header behind large metadata is found without reading the whole file.
+const SnapshotFileReader = struct {
+    file: std.Io.File,
+
+    fn readAt(context: *const anyopaque, offset: u64, buffer: []u8) []const u8 {
+        const self: *const SnapshotFileReader = @ptrCast(@alignCast(context));
+        const len = self.file.readPositionalAll(io_mod.getIo(), buffer, offset) catch return buffer[0..0];
+        return buffer[0..len];
+    }
+
+    fn dimensions(self: *const SnapshotFileReader) ?image_data.Dimensions {
+        return image_data.positionalImageDimensions(.{ .context = self, .read_at = readAt });
+    }
+};
 
 /// Reports whether a snapshot file is wider or taller than the model pixel
 /// limit. Unreadable dimensions report false and keep the byte-limit path.
-fn snapshotExceedsModelDimensions(
-    alloc: std.mem.Allocator,
-    dir: std.Io.Dir,
-    name: []const u8,
-    budget: CaptureBudget,
-) !bool {
+fn snapshotExceedsModelDimensions(dir: std.Io.Dir, name: []const u8, budget: CaptureBudget) !bool {
     try budget.check();
     var file = dir.openFile(io_mod.getIo(), name, .{
         .allow_directory = false,
@@ -902,30 +935,9 @@ fn snapshotExceedsModelDimensions(
         else => return err,
     };
     defer file.close(io_mod.getIo());
-    const probe = try alloc.alloc(u8, dimension_probe_bytes);
-    defer alloc.free(probe);
-    var read_buffer: [8192]u8 = undefined;
-    var reader = file.readerStreaming(io_mod.getIo(), &read_buffer);
-    const probe_len = try reader.interface.readSliceShort(probe);
-    const dimensions = image_data.imageDimensions(probe[0..probe_len]) orelse return false;
+    const reader: SnapshotFileReader = .{ .file = file };
+    const dimensions = reader.dimensions() orelse return false;
     return dimensions.exceedsModelLimit();
-}
-
-/// Returns a PNG copy of `bytes` shrunk to the model pixel limit, owned by
-/// `alloc`, or null when `bytes` is not an oversized PNG or cannot be decoded
-/// here.
-fn downscaleOversizedPng(alloc: std.mem.Allocator, media_type: []const u8, bytes: []const u8) std.mem.Allocator.Error!?[]u8 {
-    if (!png_downscale.supportsMediaType(media_type)) return null;
-    const dimensions = image_data.imageDimensions(bytes) orelse return null;
-    if (!dimensions.exceedsModelLimit()) return null;
-    const smaller = png_downscale.downscale(alloc, bytes, image_data.max_image_dimension) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidPng, error.UnsupportedPng => {
-            debug_trace.logf("images", "event=png_downscale_skipped reason={s}", .{@errorName(err)});
-            return null;
-        },
-    };
-    return smaller.png;
 }
 
 /// Writes a copy of a PNG snapshot, shrunk to the model pixel limit, into
@@ -956,17 +968,29 @@ fn downscalePngSnapshot(
         var reader = source.readerStreaming(io_mod.getIo(), &read_buffer);
         reader.interface.readSliceAll(source_bytes) catch return error.ImagePreparationFailed;
     }
-    const smaller = try downscaleOversizedPng(alloc, "image/png", source_bytes) orelse return false;
-    defer alloc.free(smaller);
-    if (!fitsEncodedLimit(smaller.len)) return false;
+    const smaller = try png_downscale.downscaleOversized(alloc, "image/png", source_bytes) orelse return false;
+    defer alloc.free(smaller.png);
+    if (!fitsEncodedLimit(smaller.png.len)) return false;
     try budget.check();
     var candidate = try dir.createFile(io_mod.getIo(), candidate_name, .{
         .truncate = true,
         .resolve_beneath = true,
     });
     defer candidate.close(io_mod.getIo());
-    try candidate.writeStreamingAll(io_mod.getIo(), smaller);
+    try candidate.writeStreamingAll(io_mod.getIo(), smaller.png);
     try candidate.sync(io_mod.getIo());
+    return true;
+}
+
+/// Shrinks an oversized PNG snapshot to the model pixel limit in place.
+/// Returns false when the snapshot is still over the limit, which callers
+/// must not send.
+pub fn fitVerifiedSnapshotToModelLimit(alloc: std.mem.Allocator, verified: *VerifiedSnapshot) std.mem.Allocator.Error!bool {
+    const dimensions = image_data.imageDimensions(verified.bytes) orelse return true;
+    if (!dimensions.exceedsModelLimit()) return true;
+    const smaller = try png_downscale.downscaleOversized(alloc, verified.media_type, verified.bytes) orelse return false;
+    alloc.free(verified.bytes);
+    verified.bytes = smaller.png;
     return true;
 }
 
@@ -981,26 +1005,23 @@ fn attachmentDimensions(
     cache_alloc: std.mem.Allocator,
     cache: *AttachmentDimensionCache,
     attachment: types.ImageAttachment,
-    probe: []u8,
 ) std.mem.Allocator.Error!?image_data.Dimensions {
     if (attachment.inline_data) |bytes| return image_data.imageDimensions(bytes);
     const path = attachment.snapshot_path orelse return null;
-    const digest = attachment.snapshot_sha256 orelse return probeSnapshotDimensions(path, probe);
+    const digest = attachment.snapshot_sha256 orelse return probeSnapshotDimensions(path);
     if (cache.get(digest)) |cached| return cached;
-    const dimensions = probeSnapshotDimensions(path, probe);
+    const dimensions = probeSnapshotDimensions(path);
     const key = try cache_alloc.dupe(u8, digest);
     errdefer cache_alloc.free(key);
     try cache.put(cache_alloc, key, dimensions);
     return dimensions;
 }
 
-fn probeSnapshotDimensions(path: []const u8, probe: []u8) ?image_data.Dimensions {
+fn probeSnapshotDimensions(path: []const u8) ?image_data.Dimensions {
     var file = openSnapshotFileNoFollow(path) catch return null;
     defer file.close(io_mod.getIo());
-    var read_buffer: [8192]u8 = undefined;
-    var reader = file.readerStreaming(io_mod.getIo(), &read_buffer);
-    const len = reader.interface.readSliceShort(probe) catch return null;
-    return image_data.imageDimensions(probe[0..len]);
+    const reader: SnapshotFileReader = .{ .file = file };
+    return reader.dimensions();
 }
 
 fn writeWithheldAttachmentNotice(
@@ -1043,9 +1064,8 @@ fn mediaTypeExtension(media_type: []const u8) ?[]const u8 {
 
 pub const AttachmentProjection = struct {
     messages: []const types.ChatMessage,
-    /// Attachments left out of the most recent user message, which the user
-    /// just sent and has not been told about yet.
-    latest_withheld: usize = 0,
+    /// Ids of the attachments left out of the request, in message order.
+    withheld_ids: []const usize = &.{},
 };
 
 /// Leaves attachments over the model pixel limit out of a request and tells
@@ -1060,22 +1080,14 @@ pub fn withholdOversizedAttachments(
     cache: *AttachmentDimensionCache,
     messages: []const types.ChatMessage,
 ) !AttachmentProjection {
-    var probe: ?[]u8 = null;
     var result: ?[]types.ChatMessage = null;
-    var latest_user: ?usize = null;
-    for (messages, 0..) |message, index| {
-        if (message.role == .user) latest_user = index;
-    }
-    var latest_withheld: usize = 0;
+    var withheld_ids: std.ArrayList(usize) = .empty;
     for (messages, 0..) |message, index| {
         if (message.images.len == 0) continue;
-        const probe_buffer = probe orelse try arena.alloc(u8, dimension_probe_bytes);
-        probe = probe_buffer;
-
         var kept: ?std.ArrayList(types.ImageAttachment) = null;
         var notice: std.Io.Writer.Allocating = .init(arena);
         for (message.images, 0..) |image, image_index| {
-            const dimensions = try attachmentDimensions(cache_alloc, cache, image, probe_buffer);
+            const dimensions = try attachmentDimensions(cache_alloc, cache, image);
             const oversized = if (dimensions) |size| size.exceedsModelLimit() else false;
             if (!oversized) {
                 if (kept) |*list| list.appendAssumeCapacity(image);
@@ -1085,7 +1097,7 @@ pub fn withholdOversizedAttachments(
                 kept = try .initCapacity(arena, message.images.len);
                 kept.?.appendSliceAssumeCapacity(message.images[0..image_index]);
             }
-            if (latest_user == index) latest_withheld += 1;
+            try withheld_ids.append(arena, image.id);
             debug_trace.logf("images", "event=attachment_withheld image_id={d} media_type={s} width={d} height={d} max_dimension={d}", .{ image.id, image.media_type, dimensions.?.width, dimensions.?.height, image_data.max_image_dimension });
             writeWithheldAttachmentNotice(&notice.writer, image, dimensions.?) catch return error.OutOfMemory;
         }
@@ -1096,7 +1108,7 @@ pub fn withholdOversizedAttachments(
         projected[index].images = kept_images.items;
         projected[index].content = try std.mem.concat(arena, u8, &.{ notice.written(), message.content orelse "" });
     }
-    return .{ .messages = result orelse messages, .latest_withheld = latest_withheld };
+    return .{ .messages = result orelse messages, .withheld_ids = withheld_ids.items };
 }
 
 fn fitsEncodedLimit(raw_bytes: usize) bool {
@@ -3517,7 +3529,7 @@ test "requests leave out attachments over the model pixel limit and name their s
     try std.testing.expectEqualStrings("ok", projected[1].content.?);
     try std.testing.expectEqual(@as(usize, 2), messages[0].images.len);
     try std.testing.expectEqualStrings("compare [Image #1] and [Image #2]", messages[0].content.?);
-    try std.testing.expectEqual(@as(usize, 1), projection.latest_withheld);
+    try std.testing.expectEqualSlices(usize, &.{1}, projection.withheld_ids);
 }
 
 test "requests read each attachment snapshot once per cache" {
@@ -3546,8 +3558,7 @@ test "requests read each attachment snapshot once per cache" {
     try std.testing.expectEqual(@as(usize, 0), first.messages[0].images.len);
     try std.testing.expectEqual(@as(usize, 0), second.messages[0].images.len);
     try std.testing.expectEqualStrings(first.messages[0].content.?, second.messages[0].content.?);
-    // The withheld image belongs to an earlier message, not the one just sent.
-    try std.testing.expectEqual(@as(usize, 0), second.latest_withheld);
+    try std.testing.expectEqualSlices(usize, &.{1}, second.withheld_ids);
 }
 
 test "requests ask for a smaller copy of an oversized in-memory attachment" {
@@ -3585,7 +3596,7 @@ test "requests keep attachments within the pixel limit unchanged" {
     const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages);
 
     try std.testing.expectEqual(@as([*]const types.ChatMessage, &messages), projection.messages.ptr);
-    try std.testing.expectEqual(@as(usize, 0), projection.latest_withheld);
+    try std.testing.expectEqual(@as(usize, 0), projection.withheld_ids.len);
 }
 
 fn testCaptureFile(alloc: std.mem.Allocator, tmp: *std.testing.TmpDir, name: []const u8, bytes: []const u8, media_type: []const u8) !types.ImageAttachment {
@@ -3627,17 +3638,8 @@ test "capture downscales a PNG over both the byte and pixel limits on every plat
     defer tmp.cleanup();
     const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
     defer alloc.free(png);
-    // A large ancillary chunk after IHDR pushes the file over the byte limit
-    // without changing its pixels.
-    const ihdr_end = 8 + 25;
-    const padding_len = max_encoded_image_bytes;
-    const padded = try alloc.alloc(u8, png.len + 12 + padding_len);
+    const padded = try png_downscale.testPaddedPng(alloc, png, max_encoded_image_bytes);
     defer alloc.free(padded);
-    @memcpy(padded[0..ihdr_end], png[0..ihdr_end]);
-    std.mem.writeInt(u32, padded[ihdr_end..][0..4], @intCast(padding_len), .big);
-    @memcpy(padded[ihdr_end + 4 ..][0..4], "zzPd");
-    @memset(padded[ihdr_end + 8 ..][0 .. padding_len + 4], 0);
-    @memcpy(padded[ihdr_end + 12 + padding_len ..], png[ihdr_end..]);
     try std.testing.expect(!fitsEncodedLimit(padded.len));
     var attachment = try testCaptureFile(alloc, &tmp, "padded.png", padded, "image/png");
     defer types.freeImageAttachment(alloc, attachment);
@@ -3654,6 +3656,107 @@ test "capture downscales a PNG over both the byte and pixel limits on every plat
         image_data.imageDimensions(verified.bytes),
     );
     try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "capture never rejects an image that is only over the pixel limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Too wide for the in-process decoder and too thin for some platform
+    // resizers, so capture may keep the source unchanged.
+    const png = try png_downscale.testSolidGrayPng(alloc, 16385, 2, 128);
+    defer alloc.free(png);
+    var attachment = try testCaptureFile(alloc, &tmp, "thin.png", png, "image/png");
+    defer types.freeImageAttachment(alloc, attachment);
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+
+    try captureImageSnapshot(alloc, &attachment, snapshot_dir);
+
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    const kept = std.mem.eql(u8, png, verified.bytes);
+    try std.testing.expect(kept or !image_data.imageDimensions(verified.bytes).?.exceedsModelLimit());
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
+}
+
+test "inline capture downscales an oversized PNG over the byte limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+    defer alloc.free(snapshot_dir);
+    const wide = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
+    defer alloc.free(wide);
+    const padded_wide = try png_downscale.testPaddedPng(alloc, wide, max_encoded_image_bytes);
+    defer alloc.free(padded_wide);
+
+    const attachment = try captureInlineImageBytes(alloc, 1, "image/png", padded_wide, snapshot_dir);
+    defer types.freeImageAttachment(alloc, attachment);
+    var verified = try loadVerifiedSnapshot(alloc, attachment, .{});
+    defer verified.deinit(alloc);
+    try std.testing.expectEqual(
+        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
+        image_data.imageDimensions(verified.bytes),
+    );
+
+    // Within the pixel limit, downscaling cannot shrink the bytes.
+    const small = try png_downscale.testSolidGrayPng(alloc, 64, 8, 128);
+    defer alloc.free(small);
+    const padded_small = try png_downscale.testPaddedPng(alloc, small, max_encoded_image_bytes);
+    defer alloc.free(padded_small);
+    try std.testing.expectError(error.ImageTooLarge, captureInlineImageBytes(alloc, 2, "image/png", padded_small, snapshot_dir));
+}
+
+test "requests find a JPEG frame header behind large metadata" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const segment_count = 6;
+    const segment_len: usize = 2 + 65535;
+    const frame = image_data.testJpeg(4032, 3024);
+    const jpeg = try arena.alloc(u8, 2 + segment_count * segment_len + frame.len - 2);
+    @memcpy(jpeg[0..2], "\xff\xd8");
+    for (0..segment_count) |index| {
+        const segment = jpeg[2 + index * segment_len ..][0..segment_len];
+        @memset(segment, 0);
+        @memcpy(segment[0..4], "\xff\xe1\xff\xff");
+    }
+    @memcpy(jpeg[2 + segment_count * segment_len ..], frame[2..]);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "image-1-0000000000000001.bin", .data = jpeg });
+    const path = try io_mod.dirRealpathAlloc(arena, tmp.dir, "image-1-0000000000000001.bin");
+    const images = [_]types.ImageAttachment{
+        .{ .id = 1, .path = @constCast("portrait.jpg"), .media_type = @constCast("image/jpeg"), .snapshot_path = path },
+    };
+    const messages = [_]types.ChatMessage{.{ .role = .user, .content = "[Image #1]", .images = &images }};
+    var cache: AttachmentDimensionCache = .empty;
+
+    const projection = try withholdOversizedAttachments(arena, arena, &cache, &messages);
+
+    try std.testing.expectEqualSlices(usize, &.{1}, projection.withheld_ids);
+    try std.testing.expect(std.mem.startsWith(u8, projection.messages[0].content.?, "[Image #1 not sent: image/jpeg is 4032x3024 pixels"));
+}
+
+test "verified snapshots shrink oversized PNGs and refuse other oversized images" {
+    const alloc = std.testing.allocator;
+    const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
+    var shrunk: VerifiedSnapshot = .{ .bytes = png, .media_type = "image/png" };
+    defer shrunk.deinit(alloc);
+    try std.testing.expect(try fitVerifiedSnapshotToModelLimit(alloc, &shrunk));
+    try std.testing.expectEqual(
+        @as(?image_data.Dimensions, .{ .width = 2000, .height = 7 }),
+        image_data.imageDimensions(shrunk.bytes),
+    );
+
+    var jpeg: VerifiedSnapshot = .{ .bytes = try alloc.dupe(u8, &image_data.testJpeg(3420, 2224)), .media_type = "image/jpeg" };
+    defer jpeg.deinit(alloc);
+    try std.testing.expect(!try fitVerifiedSnapshotToModelLimit(alloc, &jpeg));
+
+    var small: VerifiedSnapshot = .{ .bytes = try alloc.dupe(u8, &image_data.testJpeg(640, 480)), .media_type = "image/jpeg" };
+    defer small.deinit(alloc);
+    try std.testing.expect(try fitVerifiedSnapshotToModelLimit(alloc, &small));
 }
 
 test "in-memory capture downscales an oversized PNG and keeps other formats" {

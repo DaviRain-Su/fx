@@ -7365,15 +7365,21 @@ fn processQueuedPromptLoop(
                     &attachment_dimensions,
                     try runtime_execution_memory.materializeToolImages(overlay_arena, config, result_request_messages),
                 );
-                // The model is told where withheld attachments are saved; the
-                // user who just attached them hears about it once per turn.
-                if (projection.latest_withheld > 0 and !attachment_withheld_notified) {
+                // The model gets a note for each withheld attachment. The user
+                // hears about ones attached this turn, once per turn.
+                var withheld_now: usize = 0;
+                for (projection.withheld_ids) |id| {
+                    for (job.images) |image| {
+                        if (image.id == id) withheld_now += 1;
+                    }
+                }
+                if (withheld_now > 0 and !attachment_withheld_notified) {
                     attachment_withheld_notified = true;
                     const limit = image_data.max_image_dimension;
-                    try deps.push_text(deps.ctx, .{ .operational = if (projection.latest_withheld == 1)
-                        std.fmt.comptimePrint("An attached image is over {d} pixels per side and fx can't downscale it here, so the model gets its saved file path instead of the image.", .{limit})
+                    try deps.push_text(deps.ctx, .{ .operational = if (withheld_now == 1)
+                        std.fmt.comptimePrint("An attached image is over {d} pixels per side and fx can't downscale it here, so the model gets a note about it instead of the image.", .{limit})
                     else
-                        std.fmt.comptimePrint("Some attached images are over {d} pixels per side and fx can't downscale them here, so the model gets their saved file paths instead of the images.", .{limit}) });
+                        std.fmt.comptimePrint("Some attached images are over {d} pixels per side and fx can't downscale them here, so the model gets a note about them instead of the images.", .{limit}) });
                     try deps.push_text(deps.ctx, .{ .operational = "\n" });
                 }
                 break :native projection.messages;

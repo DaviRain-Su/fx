@@ -26,6 +26,7 @@ import {
   toolShapesWithoutDescriptions,
 } from "./conditional-guidance-oracle";
 import { expectPermissionModeContext } from "./permission-mode-context";
+import { paddedPng, pngPixelSize, solidPng } from "./fixtures/image-encoding";
 import {
   canonicalSubagentIdForStore,
   FAKE_GATEWAY_MODEL,
@@ -5767,6 +5768,49 @@ describe("acp: model-independent", () => {
           data: imageData,
         });
         expect(client.stderr).toBe("");
+      } finally {
+        await client?.close();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "image prompts over both the byte and pixel limits are downscaled",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-image-oversized-");
+      const image = paddedPng(solidPng(3420, 2224), 6_000_000);
+      const gateway = startFakeGateway(
+        [finalText("oversized image prompt complete")],
+        {
+          models: [{
+            id: FAKE_GATEWAY_MODEL,
+            type: "language",
+            tags: ["vision", "file-input", "tool-use"],
+          }],
+        },
+      );
+      try {
+        client = await AcpClient.create({
+          cwd: root.workspace,
+          env: fakeGatewayEnv(root, gateway),
+        });
+        await startCodeSession(client);
+        const prompted = await runPromptBlocks(
+          client,
+          [{ type: "image", data: image.toString("base64"), mimeType: "image/png" }],
+          TIMEOUT,
+        );
+        expect(prompted.promptResult.result.stopReason).toBe("end_turn");
+        expect(gateway.requests).toHaveLength(1);
+        const files = acpGatewayRequest(gateway.requests[0]!.body).prompt
+          .flatMap((message) => Array.isArray(message.content) ? message.content as Array<Record<string, any>> : [])
+          .filter((part) => part.type === "file");
+        expect(files).toHaveLength(1);
+        expect(files[0]!.mediaType).toBe("image/png");
+        expect(pngPixelSize(Buffer.from(files[0]!.data.data, "base64"))).toEqual({ width: 2000, height: 1301 });
       } finally {
         await client?.close();
         gateway.stop();

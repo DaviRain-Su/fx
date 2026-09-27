@@ -694,10 +694,7 @@ fn downscaleToolImage(arena: Allocator, scratch: Allocator, image: types.ToolIma
     const png = try scratch.alloc(u8, png_len);
     defer scratch.free(png);
     decoder.decode(png, image.data) catch return null;
-    const smaller = png_downscale.downscale(scratch, png, image_data.max_image_dimension) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.InvalidPng, error.UnsupportedPng => return null,
-    };
+    const smaller = try png_downscale.downscaleOversized(scratch, image.mime_type, png) orelse return null;
     defer scratch.free(smaller.png);
     const encoded_len = std.base64.standard.Encoder.calcSize(smaller.png.len);
     if (encoded_len > image_data.max_encoded_image_bytes) return null;
@@ -777,8 +774,8 @@ fn fitToolImagesForHistory(arena: Allocator, scratch: Allocator, config: Config,
 }
 
 /// Leaves out stored images over the model pixel limit. They were saved
-/// before images were fitted on entry; loading the source again yields a
-/// downscaled copy.
+/// before images were fitted on entry; loading a PNG source again yields a
+/// downscaled copy, while other formats need a smaller copy.
 fn withholdOversizedStoredImages(arena: Allocator, images: []const types.ToolImage) !FittedToolImages {
     if (countOversizedImages(images) == 0) return .{ .images = images };
 
@@ -790,9 +787,14 @@ fn withholdOversizedStoredImages(arena: Allocator, images: []const types.ToolIma
             if (dimensions.exceedsModelLimit()) {
                 fitted.withheld += 1;
                 try notice.writer.print(
-                    "[Image not sent: {d}x{d} pixels is over the {d}-pixel limit per side, so it is not visible in this conversation. Load it again to get a downscaled copy.]\n",
-                    .{ dimensions.width, dimensions.height, image_data.max_image_dimension },
+                    "[Image not sent: {s} is {d}x{d} pixels, over the {d}-pixel limit per side, so it is not visible in this conversation.",
+                    .{ image.mime_type, dimensions.width, dimensions.height, image_data.max_image_dimension },
                 );
+                if (png_downscale.supportsMediaType(image.mime_type)) {
+                    try notice.writer.writeAll(" Load it again to get a downscaled copy.]\n");
+                } else {
+                    try notice.writer.print(" Load a copy at most {d} pixels per side instead, without changing the original.]\n", .{image_data.max_image_dimension});
+                }
                 continue;
             }
         }
@@ -989,6 +991,7 @@ test "request materialization withholds oversized images saved before fitting" {
     var cancel = std.atomic.Value(bool).init(false);
     const images = [_]types.ToolImage{
         try testPngHeaderToolImage(arena, 3420, 2224),
+        try testJpegHeaderToolImage(arena, 4032, 3024),
         try testPngHeaderToolImage(arena, 10, 10),
     };
     const messages = [_]ChatMessage{
@@ -999,12 +1002,14 @@ test "request materialization withholds oversized images saved before fitting" {
     const materialized = try materializeToolImages(arena, testImageConfig(&cancel), &messages);
 
     try std.testing.expectEqual(@as(usize, 1), materialized[0].tool_result_memory.?.tool_images.len);
-    try std.testing.expectEqualStrings(images[1].data, materialized[0].tool_result_memory.?.tool_images[0].data);
+    try std.testing.expectEqualStrings(images[2].data, materialized[0].tool_result_memory.?.tool_images[0].data);
     try std.testing.expectEqualStrings(
-        "[Image not sent: 3420x2224 pixels is over the 2000-pixel limit per side, so it is not visible in this conversation. Load it again to get a downscaled copy.]\nimage attached",
+        "[Image not sent: image/png is 3420x2224 pixels, over the 2000-pixel limit per side, so it is not visible in this conversation. Load it again to get a downscaled copy.]\n" ++
+            "[Image not sent: image/jpeg is 4032x3024 pixels, over the 2000-pixel limit per side, so it is not visible in this conversation. Load a copy at most 2000 pixels per side instead, without changing the original.]\n" ++
+            "image attached",
         materialized[0].content.?,
     );
-    try std.testing.expectEqual(@as(usize, 2), messages[0].tool_result_memory.?.tool_images.len);
+    try std.testing.expectEqual(@as(usize, 3), messages[0].tool_result_memory.?.tool_images.len);
     try std.testing.expectEqualStrings("retry", materialized[1].content.?);
 }
 

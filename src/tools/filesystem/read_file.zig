@@ -244,14 +244,11 @@ fn imageToolResult(
     // PNGs over the pixel limit are downscaled when the result enters history.
     // One that is over the byte limit as well is downscaled here, so it fits
     // the attach limit and its full size never enters tool memory.
-    var smaller: ?png_downscale.Downscaled = null;
+    const smaller = if (std.base64.standard.Encoder.calcSize(bytes.len) > image_data.max_encoded_image_bytes)
+        try png_downscale.downscaleOversized(ctx.allocator, mime_type, bytes)
+    else
+        null;
     defer if (smaller) |copy| ctx.allocator.free(copy.png);
-    if (oversized and downscalable and std.base64.standard.Encoder.calcSize(bytes.len) > image_data.max_encoded_image_bytes) {
-        smaller = png_downscale.downscale(ctx.allocator, bytes, image_data.max_image_dimension) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.InvalidPng, error.UnsupportedPng => null,
-        };
-    }
     const attached = if (smaller) |copy| copy.png else bytes;
     const encoded_len = std.base64.standard.Encoder.calcSize(attached.len);
     if (encoded_len > image_data.max_encoded_image_bytes) {
@@ -859,17 +856,8 @@ test "read_file downscales a PNG over both the byte and pixel limits" {
     defer tmp.cleanup();
     const png = try png_downscale.testSolidGrayPng(alloc, 2400, 8, 128);
     defer alloc.free(png);
-    // A large ancillary chunk after IHDR pushes the file over the attach
-    // limit without changing its pixels.
-    const ihdr_end = 8 + 25;
-    const padding_len = image_data.max_encoded_image_bytes;
-    const padded = try alloc.alloc(u8, png.len + 12 + padding_len);
+    const padded = try png_downscale.testPaddedPng(alloc, png, image_data.max_encoded_image_bytes);
     defer alloc.free(padded);
-    @memcpy(padded[0..ihdr_end], png[0..ihdr_end]);
-    std.mem.writeInt(u32, padded[ihdr_end..][0..4], @intCast(padding_len), .big);
-    @memcpy(padded[ihdr_end + 4 ..][0..4], "zzPd");
-    @memset(padded[ihdr_end + 8 ..][0 .. padding_len + 4], 0);
-    @memcpy(padded[ihdr_end + 12 + padding_len ..], png[ihdr_end..]);
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "padded.png", .data = padded });
     const path = try tmpPath(alloc, tmp, "padded.png");
     defer alloc.free(path);
