@@ -15,8 +15,14 @@ afterEach(() => {
   if (workDir) { cleanupWorkDir(workDir); workDir = null; }
 });
 
-const TABLE_DELIMITER_ROW = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$/m;
+// GFM accepts a single dash per delimiter cell, with optional alignment colons.
+const TABLE_DELIMITER_ROW = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$/m;
 const HEADING = /^#{1,6}\s/m;
+
+// Comment lines inside fenced examples are not headings.
+function withoutFencedCode(text: string): string {
+  return text.replace(/^\s*(```|~~~)[\s\S]*?^\s*\1\s*$/gm, "");
+}
 
 describe("eval: system prompt override", () => {
   test(
@@ -58,7 +64,9 @@ describe("eval: default system prompt response format", () => {
         "Compare TCP, UDP, and QUIC by reliability, ordering, connection setup, and typical use cases.",
         { cwd: workDir, timeoutSec: 90 },
       );
+      expect(result.json.exit_code).toBe(0);
       expect(result.json.output).toMatch(TABLE_DELIMITER_ROW);
+      expect(result.json.output).toContain("QUIC");
     },
     TIMEOUT,
   );
@@ -83,6 +91,7 @@ describe("eval: default system prompt response format", () => {
         "List every service defined in services/ with its name, port, owner, and language.",
         { cwd: workDir, timeoutSec: 90 },
       );
+      expect(result.json.exit_code).toBe(0);
       const output = result.json.output;
       expect(output).toMatch(TABLE_DELIMITER_ROW);
       for (const service of services) expect(output).toContain(service.name);
@@ -95,12 +104,14 @@ describe("eval: default system prompt response format", () => {
     async () => {
       workDir = createWorkDir();
       const result = await runEval(
-        "In one or two sentences, what does the -r flag do for cp?",
+        "What does the -r flag do for cp?",
         { cwd: workDir, timeoutSec: 60 },
       );
+      expect(result.json.exit_code).toBe(0);
       const output = result.json.output;
+      expect(output.toLowerCase()).toContain("recursive");
       expect(output).not.toMatch(TABLE_DELIMITER_ROW);
-      expect(output).not.toMatch(HEADING);
+      expect(withoutFencedCode(output)).not.toMatch(HEADING);
     },
     TIMEOUT,
   );
