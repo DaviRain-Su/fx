@@ -2131,6 +2131,9 @@ test "input escape parser resolves keypad keys reported with an event type" {
     try expectEscapeAction("[57412;1:1u", .{ .remapped_byte = '-' });
     try expectEscapeAction("[57412;1:2u", .{ .remapped_byte = '-' });
     try expectEscapeAction("[57412;1:3u", .ignore);
+    // A multi-digit event type stays non-actionable instead of collapsing to
+    // its last digit.
+    try expectEscapeAction("[57412;1:12u", .ignore);
     try expectEscapeAction("[57410;1:1u", .{ .remapped_byte = '/' });
     try expectEscapeAction("[57414;1:1u", .{ .remapped_byte = '\r' });
     try expectEscapeAction("[57419;1:1u", .cursor_up);

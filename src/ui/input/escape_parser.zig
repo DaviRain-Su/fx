@@ -764,7 +764,11 @@ pub fn consumeInputEscapeByteWithMouse(
         // close a panel or move the caret.
         kitty_escape_event_type_stage => {
             if (byte >= '0' and byte <= '9') {
-                param.* = (param.* & 0xFFF0) | (byte - '0');
+                // The low nibble holds the event type while the high bits hold
+                // the modifiers. Accumulate instead of overwriting so a
+                // multi-digit event type stays out of the actionable range.
+                const event_digits = (param.* & 0x0F) * 10 + (byte - '0');
+                param.* = (param.* & 0xFFF0) | @min(event_digits, 0x0F);
                 return null;
             }
             if (byte == 'u') {
