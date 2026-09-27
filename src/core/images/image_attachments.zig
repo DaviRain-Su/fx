@@ -1148,6 +1148,7 @@ fn waitForImageNormalizer(
     deadline: std.Io.Clock.Timestamp,
     cancel_flag: ?*const std.atomic.Value(bool),
 ) !std.process.Child.Term {
+    const pid = child.id.?;
     var select_buffer: [3]ImageNormalizerEvent = undefined;
     var select: std.Io.Select(ImageNormalizerEvent) = .init(
         io_mod.getIo(),
@@ -1160,7 +1161,7 @@ fn waitForImageNormalizer(
         waitForImageNormalizerTimeout,
         .{deadline},
     ) catch |err| {
-        select.cancelDiscard();
+        stopImageNormalizer(&select, pid);
         return err;
     };
     if (cancel_flag) |flag| {
@@ -1169,13 +1170,13 @@ fn waitForImageNormalizer(
             waitForImageNormalizerCancellation,
             .{flag},
         ) catch |err| {
-            select.cancelDiscard();
+            stopImageNormalizer(&select, pid);
             return err;
         };
     }
 
     const event = select.await() catch |err| {
-        select.cancelDiscard();
+        stopImageNormalizer(&select, pid);
         return err;
     };
     return switch (event) {
@@ -1184,26 +1185,38 @@ fn waitForImageNormalizer(
             break :blk result catch |err| return err;
         },
         .timeout => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return err;
-            };
-            select.cancelDiscard();
+            stopImageNormalizer(&select, pid);
+            try result;
             return error.TimedOut;
         },
         .cancelled => |result| {
-            result catch |err| {
-                select.cancelDiscard();
-                return err;
-            };
-            select.cancelDiscard();
+            stopImageNormalizer(&select, pid);
+            try result;
             return error.Cancelled;
         },
     };
 }
 
-/// Runs a resizer process until it exits, `timeout` passes, or the budget's
-/// deadline passes when it has one.
+/// Kills a resizer that is still running, then waits for the pending wait
+/// task to collect it. Canceling that task instead would leave the process
+/// running and never collected, free to write its output later.
+fn stopImageNormalizer(
+    select: *std.Io.Select(ImageNormalizerEvent),
+    pid: std.process.Child.Id,
+) void {
+    std.posix.kill(pid, .KILL) catch |err| debug_trace.logf(
+        "images",
+        "event=image_normalizer_kill_failed err={s}",
+        .{@errorName(err)},
+    );
+    while (select.await()) |event| {
+        if (event == .wait) break;
+    } else |_| {}
+    select.cancelDiscard();
+}
+
+/// Runs a resizer process until it exits or its deadline passes: the budget's
+/// deadline when it has one, otherwise `timeout` from now.
 fn runImageNormalizerProcess(
     argv: []const []const u8,
     budget: CaptureBudget,
@@ -3789,26 +3802,67 @@ test "capture rejects an image over the byte limit when the platform resizer fai
 test "capture fails when its deadline passes while the platform resizer runs" {
     if (comptime builtin.os.tag != .macos) return;
     const alloc = std.testing.allocator;
+    const frame = image_data.testJpeg(3420, 2224);
+    // A resizer failure rejects a source over the byte limit with a
+    // different error, so this source shows the deadline is what is reported.
+    const large = try alloc.alloc(u8, (max_encoded_image_bytes / 4) * 3 + 1);
+    defer alloc.free(large);
+    @memset(large, 0);
+    @memcpy(large[0..frame.len], &frame);
+    for ([_][]const u8{ &frame, large }) |jpeg| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var attachment = try testCaptureFile(alloc, &tmp, "frame.jpg", jpeg, "image/jpeg");
+        defer types.freeImageAttachment(alloc, attachment);
+        const snapshot_dir = try testSnapshotDir(alloc, &tmp);
+        defer alloc.free(snapshot_dir);
+
+        try std.testing.expectError(
+            error.TimedOut,
+            captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{
+                .deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
+                    .clock = .awake,
+                    .raw = .fromMilliseconds(500),
+                }),
+                .test_resizer = .{ .script = "sleep 5" },
+            }),
+        );
+        try std.testing.expect(attachment.snapshot_path == null);
+        try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+    }
+}
+
+test "capture stops a platform resizer that runs past its time limit" {
+    if (comptime builtin.os.tag != .macos) return;
+    const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    // The resizer records its process id, then writes its output after the
+    // time limit, as a stuck resizer that recovers late would.
+    const script = try std.fmt.allocPrint(
+        alloc,
+        "echo $$ > '{s}/resizer.pid'; sleep 1; printf late > \"$2\"",
+        .{root},
+    );
+    defer alloc.free(script);
     const jpeg = image_data.testJpeg(3420, 2224);
     var attachment = try testCaptureFile(alloc, &tmp, "frame.jpg", &jpeg, "image/jpeg");
     defer types.freeImageAttachment(alloc, attachment);
     const snapshot_dir = try testSnapshotDir(alloc, &tmp);
     defer alloc.free(snapshot_dir);
 
-    try std.testing.expectError(
-        error.TimedOut,
-        captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{
-            .deadline = std.Io.Clock.Timestamp.fromNow(std.testing.io, .{
-                .clock = .awake,
-                .raw = .fromMilliseconds(200),
-            }),
-            .test_resizer = .{ .script = "sleep 5" },
-        }),
-    );
-    try std.testing.expect(attachment.snapshot_path == null);
-    try std.testing.expectEqual(@as(usize, 0), try countSnapshotFiles(snapshot_dir));
+    try captureImageSnapshotWithBudget(alloc, &attachment, snapshot_dir, .{ .test_resizer = .{
+        .script = script,
+        .timeout = .{ .clock = .awake, .raw = .fromMilliseconds(300) },
+    } });
+
+    const pid_text = try tmp.dir.readFileAlloc(std.testing.io, "resizer.pid", alloc, .limited(32));
+    defer alloc.free(pid_text);
+    const pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trimEnd(u8, pid_text, "\n"), 10);
+    try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
+    try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
 }
 
 test "capture keeps the source when its downscaled copy is over the byte limit" {
