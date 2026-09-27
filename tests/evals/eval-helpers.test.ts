@@ -64,6 +64,7 @@ describe("eval helpers", () => {
       const overrides: Record<string, string> = {
         AI_GATEWAY_API_KEY: "fake-key",
         FX_AUTO_UPGRADE: "0",
+        FX_SOUND: "0",
         FX_GATEWAY_BASE_URL: `http://127.0.0.1:${gateway.port}`,
         FX_GATEWAY_CHAT_URL: `http://127.0.0.1:${gateway.port}/v4/ai/language-model`,
       };
@@ -72,8 +73,8 @@ describe("eval helpers", () => {
       );
       Object.assign(process.env, overrides);
       const homesBefore = evalHomes();
-      // Bun's test timeout does not end this test while the gateway holds
-      // the request open, so a runEval that never stops fx fails here.
+      // Bun's 15s test timeout did not end this test when runEval never
+      // stopped fx, so the test keeps its own deadline.
       let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<never>((_, reject) => {
         deadlineTimer = setTimeout(
