@@ -862,9 +862,12 @@ fn codeSpanUrlEnd(content: []const u8) ?usize {
     else
         return null;
 
-    var end = content.len;
-    // Code spans have no Markdown delimiters, so trailing _, *, and ~ stay in the URL.
-    while (end > scheme_len and tu.isTrailingUrlPunctuation(content[end - 1])) : (end -= 1) {}
+    // Only a sentence-final period is excluded; other suffixes can be URI bytes
+    // in literal code, including _, *, ~, !, ?, ;, :, and ,.
+    const end = if (content.len > scheme_len and content[content.len - 1] == '.')
+        content.len - 1
+    else
+        content.len;
     if (end == scheme_len or !isValidLinkUrl(content[0..end])) return null;
     for (content) |byte| if (byte <= ' ' or byte == 0x7f) return null;
     return end;

@@ -23,6 +23,7 @@ const max_csi_intermediates: usize = 2;
 const max_string_bytes: usize = 4096;
 const max_sync_bytes: usize = 1024 * 1024;
 const max_pool_entries: usize = 65_535;
+const hyperlink_compact_interval: usize = 256;
 const max_hyperlink_pool_bytes: usize = 4 * 1024 * 1024;
 const max_combining_pool_bytes: usize = 4 * 1024 * 1024;
 
@@ -329,6 +330,8 @@ pub const Grid = struct {
     /// (lookup is `id - 1`).
     hyperlink_pool: std.ArrayList(HyperlinkResource) = .empty,
     hyperlink_pool_bytes: usize = 0,
+    /// Scan cadence only; link identities do not depend on this value.
+    next_hyperlink_compaction_at: usize = hyperlink_compact_interval,
     /// Allocator-owned ordered UTF-8 suffixes indexed by
     /// `Cell.combining_suffix_id`. IDs are grid-local.
     combining_suffix_pool: std.ArrayList([]u8) = .empty,
@@ -907,11 +910,21 @@ pub const Grid = struct {
             }
         }
         const entry_bytes = uri.len + params.len;
-        if (uri.len > max_string_bytes or
-            self.hyperlink_pool.items.len >= max_pool_entries or
+        if (uri.len > max_string_bytes) return error.HyperlinkPoolCapacityExceeded;
+        if (self.hyperlink_pool.items.len >= self.next_hyperlink_compaction_at) {
+            try self.compactHyperlinkPool();
+            self.next_hyperlink_compaction_at = @min(max_pool_entries, self.hyperlink_pool.items.len + hyperlink_compact_interval);
+        }
+        if (self.hyperlink_pool.items.len >= max_pool_entries or
             entry_bytes > max_hyperlink_pool_bytes -| self.hyperlink_pool_bytes)
         {
-            return error.HyperlinkPoolCapacityExceeded;
+            try self.compactHyperlinkPool();
+            self.next_hyperlink_compaction_at = @min(max_pool_entries, self.hyperlink_pool.items.len + hyperlink_compact_interval);
+            if (self.hyperlink_pool.items.len >= max_pool_entries or
+                entry_bytes > max_hyperlink_pool_bytes -| self.hyperlink_pool_bytes)
+            {
+                return error.HyperlinkPoolCapacityExceeded;
+            }
         }
         const link = try HyperlinkResource.init(self.alloc, uri, params);
         errdefer link.deinit(self.alloc);
@@ -925,6 +938,49 @@ pub const Grid = struct {
         self.hyperlink_pool_bytes += entry_bytes;
         self.replaceActiveHyperlinkParams(active_params);
         self.current_style.hyperlink_id = @intCast(self.hyperlink_pool.items.len);
+    }
+
+    fn compactHyperlinkPool(self: *Grid) !void {
+        const remap = try self.alloc.alloc(u32, self.hyperlink_pool.items.len + 1);
+        defer self.alloc.free(remap);
+        @memset(remap, 0);
+
+        for (self.cells) |cell| try markHyperlinkId(remap, cell.style.hyperlink_id);
+        try markHyperlinkId(remap, self.current_style.hyperlink_id);
+        if (self.saved_cursor) |cursor| try markHyperlinkId(remap, cursor.style.hyperlink_id);
+        if (self.saved_normal_screen) |saved| {
+            for (saved.cells) |cell| try markHyperlinkId(remap, cell.style.hyperlink_id);
+            try markHyperlinkId(remap, saved.current_style.hyperlink_id);
+            if (saved.saved_cursor) |cursor| try markHyperlinkId(remap, cursor.style.hyperlink_id);
+        }
+
+        var live_count: usize = 0;
+        for (remap[1..]) |referenced| live_count += @intFromBool(referenced != 0);
+        if (live_count == self.hyperlink_pool.items.len) return;
+
+        var retained: usize = 0;
+        var retained_bytes: usize = 0;
+        for (self.hyperlink_pool.items, 0..) |link, index| {
+            if (remap[index + 1] == 0) {
+                link.deinit(self.alloc);
+                continue;
+            }
+            retained += 1;
+            remap[index + 1] = @intCast(retained);
+            self.hyperlink_pool.items[retained - 1] = link;
+            retained_bytes += link.uri.len + link.params.len;
+        }
+        self.hyperlink_pool.items.len = retained;
+        self.hyperlink_pool_bytes = retained_bytes;
+
+        for (self.cells) |*cell| applyHyperlinkRemap(&cell.style, remap);
+        applyHyperlinkRemap(&self.current_style, remap);
+        if (self.saved_cursor) |*cursor| applyHyperlinkRemap(&cursor.style, remap);
+        if (self.saved_normal_screen) |*saved| {
+            for (saved.cells) |*cell| applyHyperlinkRemap(&cell.style, remap);
+            applyHyperlinkRemap(&saved.current_style, remap);
+            if (saved.saved_cursor) |*cursor| applyHyperlinkRemap(&cursor.style, remap);
+        }
     }
 
     fn clearActiveHyperlink(self: *Grid) void {
@@ -1832,6 +1888,7 @@ pub const Grid = struct {
         for (self.hyperlink_pool.items) |link| link.deinit(self.alloc);
         self.hyperlink_pool.clearRetainingCapacity();
         self.hyperlink_pool_bytes = 0;
+        self.next_hyperlink_compaction_at = hyperlink_compact_interval;
         for (self.combining_suffix_pool.items) |suffix| self.alloc.free(suffix);
         self.combining_suffix_pool.clearRetainingCapacity();
         self.combining_pool_bytes = 0;
@@ -2294,6 +2351,7 @@ pub const Grid = struct {
             .tab_stops = tab_stops,
             .hyperlink_pool = pool,
             .hyperlink_pool_bytes = self.hyperlink_pool_bytes,
+            .next_hyperlink_compaction_at = self.next_hyperlink_compaction_at,
             .combining_suffix_pool = suffix_pool,
             .combining_pool_bytes = self.combining_pool_bytes,
         };
@@ -3173,6 +3231,16 @@ fn wideCellLead(cells: []const Cell, row_base: usize, col: u16) ?u16 {
     };
 }
 
+fn markHyperlinkId(remap: []u32, id: u32) !void {
+    if (id == 0) return;
+    if (id >= remap.len) return error.InvalidEngineCheckpoint;
+    remap[id] = 1;
+}
+
+fn applyHyperlinkRemap(style: *Style, remap: []const u32) void {
+    if (style.hyperlink_id != 0) style.hyperlink_id = remap[style.hyperlink_id];
+}
+
 /// Transitions between OSC 8 hyperlinks without closing a valid active link first.
 fn emitHyperlinkTransition(out: *std.Io.Writer, grid: Grid, prev_id: u32, next_id: u32) !void {
     // OSC 8 permits opening a new link without explicitly closing the active one.
@@ -4022,6 +4090,97 @@ test "OSC 8 link identity survives row diffs and checkpoints" {
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, writer.written(), first));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, writer.written(), second));
     try testing.expectEqual(@as(usize, 0), std.mem.count(u8, writer.written(), "\x1b]8;;https://example.com"));
+}
+
+test "scrolled repeated link IDs do not exhaust the hyperlink pool" {
+    const alloc = testing.allocator;
+    var grid = try Grid.init(alloc, 16, 4);
+    defer grid.deinit();
+
+    const prefix = "https://example.com/";
+    var uri: [2050]u8 = undefined;
+    @memcpy(uri[0..prefix.len], prefix);
+    @memset(uri[prefix.len..], 'x');
+    var line_buf: [2200]u8 = undefined;
+    for (0..2300) |idx| {
+        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\\r\n", .{ idx, uri[0..] });
+        try grid.feed(line);
+    }
+    try testing.expect(grid.hyperlink_pool.items.len <= 256);
+    try testing.expect(grid.hyperlink_pool_bytes < max_hyperlink_pool_bytes);
+}
+
+test "hyperlink compaction cadence does not rescan each near-full frame" {
+    const alloc = testing.allocator;
+    var grid = try Grid.init(alloc, 260, 1);
+    defer grid.deinit();
+    const uri = "https://example.com/x";
+    var line_buf: [128]u8 = undefined;
+    for (0..255) |idx| {
+        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-{d};{s}\x1b\\x\x1b]8;;\x1b\\", .{ idx, uri });
+        try grid.feed(line);
+    }
+    try grid.feed("\x1b]8;id=fx-dead;https://example.com/x\x1b\\\x1b]8;;\x1b\\");
+    try testing.expectEqual(@as(usize, 256), grid.hyperlink_pool.items.len);
+
+    try grid.feed("\x1b[1;1H\x1b]8;id=fx-next;https://example.com/x\x1b\\x\x1b]8;;\x1b\\");
+    try testing.expectEqual(@as(usize, 256), grid.hyperlink_pool.items.len);
+    const next_scan = grid.next_hyperlink_compaction_at;
+    try testing.expect(next_scan > grid.hyperlink_pool.items.len);
+
+    try grid.feed("\x1b[1;2H\x1b]8;id=fx-next-2;https://example.com/x\x1b\\x\x1b]8;;\x1b\\");
+    try testing.expectEqual(@as(usize, 257), grid.hyperlink_pool.items.len);
+    try testing.expectEqual(next_scan, grid.next_hyperlink_compaction_at);
+}
+
+test "hyperlink compaction allocation failure keeps cell links intact" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const alloc = failing.allocator();
+    var grid = try Grid.init(alloc, 260, 1);
+    defer grid.deinit();
+    var line_buf: [128]u8 = undefined;
+    for (0..256) |idx| {
+        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-{d};https://example.com/x\x1b\\x\x1b]8;;\x1b\\", .{idx});
+        try grid.feed(line);
+    }
+    try grid.osc_buffer.ensureTotalCapacity(alloc, 128);
+    const before = grid.cellAt(1, 1).?.style.hyperlink_id;
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, grid.feed("\x1b]8;id=fx-next;https://example.com/x\x1b\\"));
+    try testing.expect(grid.atControlSequenceBoundary());
+    try testing.expectEqual(@as(usize, 256), grid.hyperlink_pool.items.len);
+    try testing.expectEqual(before, grid.cellAt(1, 1).?.style.hyperlink_id);
+    try testing.expectEqualStrings("id=fx-0", grid.hyperlinkParams(before).?);
+
+    failing.fail_index = std.math.maxInt(usize);
+    try grid.feed("\x1b]8;id=fx-next;https://example.com/x\x1b\\x");
+    try testing.expectEqualStrings("id=fx-next", grid.hyperlinkParams(grid.cellAt(1, 257).?.style.hyperlink_id).?);
+}
+
+test "hyperlink compaction retains saved screen and cursor identities" {
+    const alloc = testing.allocator;
+    var grid = try Grid.init(alloc, 16, 3);
+    defer grid.deinit();
+    try grid.feed("\x1b]8;id=fx-keep;https://example.com/keep\x1b\\K\x1b7\x1b]8;;\x1b\\");
+    try grid.feed("\x1b[?1049h");
+
+    var line_buf: [128]u8 = undefined;
+    for (0..300) |idx| {
+        const line = try std.fmt.bufPrint(&line_buf, "\x1b]8;id=fx-temp-{d};https://example.com/tmp\x1b\\x\x1b]8;;\x1b\\\r\n", .{idx});
+        try grid.feed(line);
+    }
+    try testing.expect(grid.hyperlink_pool.items.len <= 256);
+    try grid.feed("\x1b[?1049l");
+    const retained_id = grid.cellAt(1, 1).?.style.hyperlink_id;
+    try testing.expectEqual(@as(u21, 'K'), grid.cellAt(1, 1).?.codepoint);
+    try testing.expectEqualStrings("id=fx-keep", grid.hyperlinkParams(retained_id).?);
+    try testing.expectEqual(retained_id, grid.saved_cursor.?.style.hyperlink_id);
+
+    const payload = try grid.checkpointPayload(alloc);
+    defer alloc.free(payload);
+    var recovered = try Grid.restoreCheckpoint(alloc, payload);
+    defer recovered.deinit();
+    try testing.expectEqualStrings("id=fx-keep", recovered.hyperlinkParams(recovered.cellAt(1, 1).?.style.hyperlink_id).?);
 }
 
 test "OSC 8 parameter replacement is atomic on allocation failure" {

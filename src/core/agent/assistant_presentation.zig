@@ -1026,6 +1026,34 @@ test "inline code URLs keep literal bytes and trailing punctuation outside links
     try std.testing.expectEqualStrings(expected, out.items);
 }
 
+test "inline code URLs preserve literal trailing URI punctuation" {
+    const alloc = std.testing.allocator;
+    const urls = [_][]const u8{
+        "https://example.com/a!",
+        "https://example.com/a?",
+        "https://example.com/a;",
+        "https://example.com/a:",
+        "https://example.com/a,",
+    };
+    for (urls) |url| {
+        var processor = MarkdownProcessor{};
+        defer processor.deinit(alloc);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        var input_buf: [128]u8 = undefined;
+        const input = try std.fmt.bufPrint(&input_buf, "Open `{s}`\n", .{url});
+        const id_before = link_id_counter;
+        try processor.push(alloc, input, &out);
+        var expected_buf: [256]u8 = undefined;
+        const expected = try std.fmt.bufPrint(
+            &expected_buf,
+            "Open \x1b[38;5;245m\x1b]8;id=fx-{d};{s}\x1b\\{s}\x1b]8;;\x1b\\\x1b[39m\n",
+            .{ id_before, url, url },
+        );
+        try std.testing.expectEqualStrings(expected, out.items);
+    }
+}
+
 test "non-URL and unsafe inline code stays literal" {
     const alloc = std.testing.allocator;
     const cases = [_][]const u8{
