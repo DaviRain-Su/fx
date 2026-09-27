@@ -143,10 +143,11 @@ fn keypadNavigationKey(keycode: u16) ?u8 {
     };
 }
 
-// Reuse the main-row arrow mapping so Shift extends the selection and
-// Ctrl/Alt/Super keep their word, paragraph, and draft jumps.
-fn navigationKeyAction(letter: u8, modifiers: u16, meta_prefixed: bool) InputEscapeAction {
-    const plain: InputEscapeAction = switch (letter) {
+// The plain navigation mapping. Every encoding that reports navigation keys
+// resolves through this one table: CSI finals, application-keypad SS3 bytes,
+// and kitty keypad codes.
+fn plainNavigationAction(letter: u8) InputEscapeAction {
+    return switch (letter) {
         'A' => .cursor_up,
         'B' => .cursor_down,
         'C' => .cursor_right,
@@ -155,6 +156,12 @@ fn navigationKeyAction(letter: u8, modifiers: u16, meta_prefixed: bool) InputEsc
         'F' => .end,
         else => unreachable,
     };
+}
+
+// Reuse the main-row arrow mapping so Shift extends the selection and
+// Ctrl/Alt/Super keep their word, paragraph, and draft jumps.
+fn navigationKeyAction(letter: u8, modifiers: u16, meta_prefixed: bool) InputEscapeAction {
+    const plain = plainNavigationAction(letter);
     if (!meta_prefixed and modifiers == 0) return plain;
     return modifiedArrowAction(letter, modifiers, meta_prefixed) orelse plain;
 }
@@ -556,15 +563,9 @@ pub fn consumeInputEscapeByteWithMouse(
             const action: ?InputEscapeAction = switch (byte) {
                 'A', 'B', 'C', 'D' => if (meta_prefixed)
                     modifiedArrowAction(byte, 0, true)
-                else switch (byte) {
-                    'A' => .cursor_up,
-                    'B' => .cursor_down,
-                    'C' => .cursor_right,
-                    'D' => .cursor_left,
-                    else => unreachable,
-                },
-                'H' => .home,
-                'F' => .end,
+                else
+                    plainNavigationAction(byte),
+                'H', 'F' => plainNavigationAction(byte),
                 'Z' => .toggle_permission_mode,
                 '<' => {
                     mouse.reset();
@@ -638,15 +639,9 @@ pub fn consumeInputEscapeByteWithMouse(
             const action: InputEscapeAction = switch (byte) {
                 'A', 'B', 'C', 'D' => if (meta_prefixed)
                     modifiedArrowAction(byte, 0, true) orelse .ignore
-                else switch (byte) {
-                    'A' => .cursor_up,
-                    'B' => .cursor_down,
-                    'C' => .cursor_right,
-                    'D' => .cursor_left,
-                    else => unreachable,
-                },
-                'H' => .home,
-                'F' => .end,
+                else
+                    plainNavigationAction(byte),
+                'H', 'F' => plainNavigationAction(byte),
                 // A terminal left in keypad application mode reports `ESC O`
                 // followed by these bytes, which must decode exactly like the
                 // kitty keypad codes.
@@ -741,12 +736,7 @@ pub fn consumeInputEscapeByteWithMouse(
             }
 
             const action: InputEscapeAction = switch (byte) {
-                'A' => .cursor_up,
-                'B' => .cursor_down,
-                'C' => .cursor_right,
-                'D' => .cursor_left,
-                'H' => .home,
-                'F' => .end,
+                'A', 'B', 'C', 'D', 'H', 'F' => plainNavigationAction(byte),
                 else => return beginControlSequenceDiscard(stage, param, param2, mouse, byte),
             };
             resetMouseEscapeDecode(stage, param, param2, mouse);
