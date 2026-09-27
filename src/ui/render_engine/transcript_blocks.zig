@@ -1447,7 +1447,14 @@ fn wrapTableCell(alloc: Allocator, cell: []const u8, width: usize, lines: *std.A
     var remaining = cell;
     while (firstCodeGlyph(remaining)) |glyph| {
         var text = tableCellCut(remaining, width);
-        if (firstCodeGlyph(text) == null) text = remaining[0 .. glyph.start + glyph.len];
+        if (!hasTableCellText(text)) {
+            // A leading space is a break like any other, not a line of its own.
+            if (remaining[glyph.start] == ' ') {
+                remaining = skipTableCellBreak(remaining, &style, &hyperlink);
+                continue;
+            }
+            text = remaining[0 .. glyph.start + glyph.len];
+        }
         var line: TableCellLine = .{
             .text = text,
             .width = display_width.visibleWidthIgnoringAnsi(text),
@@ -1461,6 +1468,15 @@ fn wrapTableCell(alloc: Allocator, cell: []const u8, width: usize, lines: *std.A
         remaining = skipTableCellBreak(remaining[text.len..], &style, &hyperlink);
     }
     if (lines.items.len == 0) try lines.append(alloc, .{ .text = "", .width = 0 });
+}
+
+fn hasTableCellText(text: []const u8) bool {
+    var index: usize = 0;
+    while (firstCodeGlyph(text[index..])) |glyph| {
+        if (text[index + glyph.start] != ' ') return true;
+        index += glyph.start + glyph.len;
+    }
+    return false;
 }
 
 /// Cuts at the last space that fits, or at the width itself when the text
@@ -4770,6 +4786,25 @@ test "wrapTableCell breaks at the column edge and never emits a blank line" {
     try std.testing.expect(lines.items[0].close_style);
     try std.testing.expectEqualStrings("bar", lines.items[1].text);
     try std.testing.expect(!lines.items[1].style.isActive());
+
+    // A code span that starts with a space drops it at the first break.
+    const leading = try std.fmt.allocPrint(alloc, "{s} configuration\x1b[39m", .{shared_theme.current().inline_code_open});
+    defer alloc.free(leading);
+    for (1..16) |narrow| {
+        try wrapTableCell(alloc, leading, narrow, &lines);
+        for (lines.items) |line| try std.testing.expect(hasTableCellText(line.text));
+    }
+}
+
+test "wrapTableCell resets a style it cannot restore before the padding" {
+    const alloc = std.testing.allocator;
+    var lines: std.ArrayList(TableCellLine) = .empty;
+    defer lines.deinit(alloc);
+
+    try wrapTableCell(alloc, "\x1b[48;5;236mfoo bar\x1b[49m", 3, &lines);
+    try std.testing.expectEqual(@as(usize, 2), lines.items.len);
+    try std.testing.expect(!lines.items[0].style.isActive());
+    try std.testing.expect(lines.items[0].close_style);
 }
 
 test "fitTableColumnWidths keeps short columns whole and gives longer text more room" {

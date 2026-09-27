@@ -802,7 +802,8 @@ async function collectFullTranscriptPages(
     pages.push(pane);
     previous = pane;
   }
-  return pages.join("\n");
+  // Paging starts at the bottom and moves up, so reverse into document order.
+  return pages.reverse().join("\n");
 }
 
 function expectRenderedMarkdown(
