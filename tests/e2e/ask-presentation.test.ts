@@ -529,6 +529,45 @@ describe("fx ask presentation", () => {
   );
 
   test.skipIf(!tmuxAvailable())(
+    "inline code URL keeps its full target across wrapped transcript rows",
+    async () => {
+      const root = createRoot();
+      const url = "http://localhost:3210/bench?run=https://github.com/vercel/e/actions/runs/36247033515";
+      const gateway = startFakeGateway([fakeGatewayFinalText(`Open \`${url}.\`\n`)]);
+      gateways.push(gateway);
+      const stderrPath = join(root.root, "stderr.log");
+      writeFileSync(stderrPath, "");
+
+      const session = await TmuxSession.create({
+        isolated: true,
+        cmd: FX_BIN,
+        cwd: root.workspace,
+        env: { ...gatewayEnv(root.home, gateway), NO_COLOR: undefined },
+        width: 82,
+        height: 24,
+        stderrPath,
+      });
+      sessions.push(session);
+
+      await session.sendText("Show the URL.");
+      await session.waitForText("3515.", TIMEOUT);
+      const pane = await session.captureFullScrollback();
+      const rows = pane.split("\n").filter((row) => row.includes("localhost:") || row.includes("3515."));
+      expect(rows).toHaveLength(2);
+      const escaped = await session.captureFullScrollbackEscapes();
+      const target = `\x1b]8;id=fx-1;${url}\x1b\\`;
+      const linkedRows = escaped.split("\n").filter((row) => row.includes(target));
+      expect(linkedRows).toHaveLength(2);
+      expect(linkedRows[0]).toContain("localhost:");
+      expect(linkedRows[1]).toContain("3515\x1b]8;;\x1b\\.");
+      expect(escaped).not.toContain(`\x1b]8;;${url}.\x1b\\`);
+      expect(readFileSync(stderrPath, "utf8")).toBe("");
+      expect(gateway.requestCount()).toBe(1);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(!tmuxAvailable())(
     "--no-color keeps the TTY layout without fx styles or hyperlinks",
     async () => {
       const root = createRoot();
