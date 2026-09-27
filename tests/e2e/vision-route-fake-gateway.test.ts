@@ -1240,9 +1240,10 @@ describe("Vision route fake Gateway", () => {
     TIMEOUT,
   );
 
-  // macOS converts other formats with sips during capture, so only other
-  // platforms keep an oversized JPEG attachment for request building.
-  test.skipIf(process.platform === "darwin")(
+  // No resizer can decode a header-only JPEG, so every platform keeps it for
+  // request building to withhold: there is no resizer on Linux, and sips
+  // fails on macOS.
+  test(
     "fx ask leaves out attachments it cannot downscale and names their saved file",
     async () => {
       const root = createIsolatedRoot();
@@ -1263,7 +1264,7 @@ describe("Vision route fake Gateway", () => {
         );
         expect(body).toContain("Save a copy at most 2000 pixels per side to a new file ending in .jpg without changing this one, then read the copy.]");
         expect(result.stderr).toContain(
-          "An attached image is over 2000 pixels per side and fx can't downscale it here, so the model gets its saved file path instead of the image.",
+          "An attached image is over 2000 pixels per side and fx can't downscale it here, so the model gets a note about it instead of the image.",
         );
       } finally {
         gateway.stop();
