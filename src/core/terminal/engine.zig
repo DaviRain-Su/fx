@@ -8,8 +8,13 @@ const contracts = @import("contracts.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const checkpoint_schema_revision: u16 = 1;
+pub const checkpoint_schema_revision: u16 = 2;
+const checkpoint_legacy_revision: u16 = 1;
 const checkpoint_magic = "FXTE";
+
+pub fn supportsCheckpointRevision(revision: u16) bool {
+    return revision == checkpoint_legacy_revision or revision == checkpoint_schema_revision;
+}
 pub const max_reply_effects: usize = 16;
 pub const max_reply_effect_bytes: usize = 256;
 pub const max_reply_effect_total_bytes: usize = 4096;
@@ -85,13 +90,39 @@ pub const Style = struct {
     bg: Color = .default,
     flags: StyleFlags = .{},
     /// Index into `Grid.hyperlink_pool`. `0` means no OSC 8 hyperlink;
-    /// IDs `>= 1` map to a URL string the cell should be wrapped with
-    /// when re-emitted by `diffBand`. IDs are grid-local; they survive
-    /// `Grid.clone` because the pool is dup'd in lockstep.
+    /// IDs `>= 1` map to a URI and its OSC 8 parameters, re-emitted by
+    /// `diffBand`. IDs are grid-local; they survive `Grid.clone` because
+    /// the pool is dup'd in lockstep.
     hyperlink_id: u32 = 0,
 
     pub fn eql(a: Style, b: Style) bool {
         return a.fg.eql(b.fg) and a.bg.eql(b.bg) and a.flags.eql(b.flags) and a.hyperlink_id == b.hyperlink_id;
+    }
+};
+
+pub const HyperlinkResource = struct {
+    uri: []u8,
+    params: []const u8,
+
+    /// The caller owns the returned resource and must call `deinit`.
+    pub fn init(alloc: Allocator, uri: []const u8, params: []const u8) !HyperlinkResource {
+        const owned_uri = try alloc.dupe(u8, uri);
+        errdefer alloc.free(owned_uri);
+        const owned_params: []const u8 = if (params.len > 0) try alloc.dupe(u8, params) else &.{};
+        return .{ .uri = owned_uri, .params = owned_params };
+    }
+
+    pub fn clone(self: HyperlinkResource, alloc: Allocator) !HyperlinkResource {
+        return init(alloc, self.uri, self.params);
+    }
+
+    pub fn deinit(self: HyperlinkResource, alloc: Allocator) void {
+        alloc.free(self.uri);
+        if (self.params.len > 0) alloc.free(self.params);
+    }
+
+    pub fn eql(self: HyperlinkResource, uri: []const u8, params: []const u8) bool {
+        return std.mem.eql(u8, self.uri, uri) and std.mem.eql(u8, self.params, params);
     }
 };
 
@@ -293,17 +324,17 @@ pub const Grid = struct {
     utf8_buffer: [4]u8 = [_]u8{0} ** 4,
     utf8_len: u8 = 0,
     utf8_expected: u8 = 0,
-    /// Allocator-owned URL strings indexed by `Style.hyperlink_id`.
+    /// Allocator-owned URI/parameter pairs indexed by `Style.hyperlink_id`.
     /// `id == 0` is the sentinel "no hyperlink" and is NOT stored here
     /// (lookup is `id - 1`).
-    hyperlink_pool: std.ArrayList([]u8) = .empty,
+    hyperlink_pool: std.ArrayList(HyperlinkResource) = .empty,
     hyperlink_pool_bytes: usize = 0,
     /// Allocator-owned ordered UTF-8 suffixes indexed by
     /// `Cell.combining_suffix_id`. IDs are grid-local.
     combining_suffix_pool: std.ArrayList([]u8) = .empty,
     combining_pool_bytes: usize = 0,
     /// Exact OSC 8 parameter bytes for the currently active hyperlink.
-    /// These are presentation state, not part of URI interning.
+    /// Cell resources retain their own copy after the active link closes.
     active_hyperlink_params: []const u8 = &.{},
     /// Normal terminal buffer state saved by DECSET ?1049. The current
     /// fields represent the alternate buffer while this is non-null.
@@ -354,7 +385,7 @@ pub const Grid = struct {
         self.osc_buffer.deinit(self.alloc);
         self.dcs_buffer.deinit(self.alloc);
         self.alloc.free(self.tab_stops);
-        for (self.hyperlink_pool.items) |url| self.alloc.free(url);
+        for (self.hyperlink_pool.items) |link| link.deinit(self.alloc);
         self.hyperlink_pool.deinit(self.alloc);
         for (self.combining_suffix_pool.items) |suffix| self.alloc.free(suffix);
         self.combining_suffix_pool.deinit(self.alloc);
@@ -862,33 +893,37 @@ pub const Grid = struct {
             return;
         }
 
-        const owned_params = if (params.len > 0)
-            try self.alloc.dupe(u8, params)
-        else
-            &.{};
-        errdefer if (owned_params.len > 0) self.alloc.free(owned_params);
-
-        // Reuse an existing pool entry when the same URL appears
-        // again so cells under one logical link share an id.
+        // A repeated open with the same parameters resumes one logical link.
+        // Different IDs on the same URI must remain separate on the terminal.
         for (self.hyperlink_pool.items, 0..) |existing, idx| {
-            if (std.mem.eql(u8, existing, uri)) {
-                self.replaceActiveHyperlinkParams(owned_params);
+            if (existing.eql(uri, params)) {
+                const active_params: []const u8 = if (params.len > 0)
+                    try self.alloc.dupe(u8, params)
+                else
+                    &.{};
+                self.replaceActiveHyperlinkParams(active_params);
                 self.current_style.hyperlink_id = @intCast(idx + 1);
                 return;
             }
         }
+        const entry_bytes = uri.len + params.len;
         if (uri.len > max_string_bytes or
             self.hyperlink_pool.items.len >= max_pool_entries or
-            self.hyperlink_pool_bytes > max_hyperlink_pool_bytes - uri.len)
+            entry_bytes > max_hyperlink_pool_bytes -| self.hyperlink_pool_bytes)
         {
             return error.HyperlinkPoolCapacityExceeded;
         }
-        const dup = try self.alloc.dupe(u8, uri);
-        errdefer self.alloc.free(dup);
+        const link = try HyperlinkResource.init(self.alloc, uri, params);
+        errdefer link.deinit(self.alloc);
+        const active_params: []const u8 = if (params.len > 0)
+            try self.alloc.dupe(u8, params)
+        else
+            &.{};
+        errdefer if (active_params.len > 0) self.alloc.free(active_params);
         try self.hyperlink_pool.ensureUnusedCapacity(self.alloc, 1);
-        self.hyperlink_pool.appendAssumeCapacity(dup);
-        self.hyperlink_pool_bytes += dup.len;
-        self.replaceActiveHyperlinkParams(owned_params);
+        self.hyperlink_pool.appendAssumeCapacity(link);
+        self.hyperlink_pool_bytes += entry_bytes;
+        self.replaceActiveHyperlinkParams(active_params);
         self.current_style.hyperlink_id = @intCast(self.hyperlink_pool.items.len);
     }
 
@@ -905,11 +940,18 @@ pub const Grid = struct {
     }
 
     /// Look up the URL string for a `Style.hyperlink_id`, or `null` for
-    /// the sentinel zero id.
+    /// the sentinel zero id. The returned bytes are borrowed from the grid.
     pub fn hyperlinkUrl(self: Grid, id: u32) ?[]const u8 {
         if (id == 0) return null;
         if (id - 1 >= self.hyperlink_pool.items.len) return null;
-        return self.hyperlink_pool.items[id - 1];
+        return self.hyperlink_pool.items[id - 1].uri;
+    }
+
+    /// Borrow the original OSC 8 parameters associated with a cell link.
+    pub fn hyperlinkParams(self: Grid, id: u32) ?[]const u8 {
+        if (id == 0) return null;
+        if (id - 1 >= self.hyperlink_pool.items.len) return null;
+        return self.hyperlink_pool.items[id - 1].params;
     }
 
     pub fn combiningSuffix(self: Grid, id: u32) ?[]const u8 {
@@ -1787,7 +1829,7 @@ pub const Grid = struct {
         self.sync_buffer.clearRetainingCapacity();
         self.current_style = .{};
         self.replaceActiveHyperlinkParams(&.{});
-        for (self.hyperlink_pool.items) |url| self.alloc.free(url);
+        for (self.hyperlink_pool.items) |link| link.deinit(self.alloc);
         self.hyperlink_pool.clearRetainingCapacity();
         self.hyperlink_pool_bytes = 0;
         for (self.combining_suffix_pool.items) |suffix| self.alloc.free(suffix);
@@ -1985,10 +2027,11 @@ pub const Grid = struct {
         if (!std.mem.eql(u8, magic, checkpoint_magic)) {
             return failGrid(error.InvalidEngineCheckpoint);
         }
-        if (try decoder.int(u16) != checkpoint_schema_revision) {
+        const revision = try decoder.int(u16);
+        if (!supportsCheckpointRevision(revision)) {
             return failGrid(error.UnsupportedEngineRevision);
         }
-        var grid = try decodeGridState(alloc, &decoder);
+        var grid = try decodeGridState(alloc, &decoder, revision);
         errdefer grid.deinit();
         if (!decoder.finished()) return failGrid(error.InvalidEngineCheckpoint);
         try grid.validateCheckpointState();
@@ -2025,7 +2068,7 @@ pub const Grid = struct {
             return error.InvalidEngineCheckpoint;
         }
         try validateUtf8Continuation(self);
-        try validatePool(self.hyperlink_pool.items, max_hyperlink_pool_bytes);
+        try validateHyperlinkPool(self.hyperlink_pool.items, max_hyperlink_pool_bytes);
         try validatePool(self.combining_suffix_pool.items, max_combining_pool_bytes);
         try validateCells(
             self.cells,
@@ -2215,14 +2258,14 @@ pub const Grid = struct {
         errdefer alloc.free(cells);
         @memcpy(cells, self.cells);
 
-        var pool: std.ArrayList([]u8) = .empty;
+        var pool: std.ArrayList(HyperlinkResource) = .empty;
         errdefer {
-            for (pool.items) |url| alloc.free(url);
+            for (pool.items) |link| link.deinit(alloc);
             pool.deinit(alloc);
         }
         try pool.ensureTotalCapacity(alloc, self.hyperlink_pool.items.len);
-        for (self.hyperlink_pool.items) |url| {
-            const dup = try alloc.dupe(u8, url);
+        for (self.hyperlink_pool.items) |link| {
+            const dup = try link.clone(alloc);
             pool.appendAssumeCapacity(dup);
         }
 
@@ -2503,7 +2546,7 @@ fn encodeGridState(encoder: *CheckpointEncoder, grid: Grid) !void {
     try encoder.bytes(&grid.utf8_buffer);
     try encoder.int(u8, grid.utf8_len);
     try encoder.int(u8, grid.utf8_expected);
-    try encodePool(encoder, grid.hyperlink_pool.items);
+    try encodeHyperlinkPool(encoder, grid.hyperlink_pool.items);
     try encodePool(encoder, grid.combining_suffix_pool.items);
     try encoder.sizedBytes(grid.active_hyperlink_params);
     try encoder.boolean(grid.saved_normal_screen != null);
@@ -2544,6 +2587,16 @@ fn encodeColor(encoder: *CheckpointEncoder, color: Color) !void {
             try encoder.int(u8, rgb.g);
             try encoder.int(u8, rgb.b);
         },
+    }
+}
+
+fn encodeHyperlinkPool(encoder: *CheckpointEncoder, pool: []const HyperlinkResource) !void {
+    const count = std.math.cast(u32, pool.len) orelse
+        return error.CheckpointTooLarge;
+    try encoder.int(u32, count);
+    for (pool) |link| {
+        try encoder.sizedBytes(link.uri);
+        try encoder.sizedBytes(link.params);
     }
 }
 
@@ -2608,6 +2661,7 @@ fn encodeOptionalIndex(
 fn decodeGridState(
     alloc: Allocator,
     decoder: *CheckpointDecoder,
+    revision: u16,
 ) !Grid {
     const rows = try decoder.int(u16);
     const cols = try decoder.int(u16);
@@ -2670,11 +2724,12 @@ fn decodeGridState(
     @memcpy(&grid.utf8_buffer, try decoder.fixed(grid.utf8_buffer.len));
     grid.utf8_len = try decoder.int(u8);
     grid.utf8_expected = try decoder.int(u8);
-    try decodePool(
+    try decodeHyperlinkPool(
         decoder,
         alloc,
         &grid.hyperlink_pool,
         &grid.hyperlink_pool_bytes,
+        revision,
         max_hyperlink_pool_bytes,
     );
     try decodePool(
@@ -2750,6 +2805,36 @@ fn decodeCursorShape(decoder: *CheckpointDecoder) !contracts.CursorShape {
         2 => .bar,
         else => error.InvalidEngineCheckpoint,
     };
+}
+
+fn decodeHyperlinkPool(
+    decoder: *CheckpointDecoder,
+    alloc: Allocator,
+    pool: *std.ArrayList(HyperlinkResource),
+    byte_count: *usize,
+    revision: u16,
+    maximum_bytes: usize,
+) !void {
+    const count = try decoder.int(u32);
+    if (count > max_pool_entries) return error.InvalidEngineCheckpoint;
+    try pool.ensureTotalCapacity(alloc, count);
+    var total: usize = 0;
+    for (0..count) |_| {
+        const uri = try decoder.ownedBytes(alloc, max_string_bytes);
+        errdefer if (uri.len > 0) alloc.free(uri);
+        const params: []const u8 = if (revision == checkpoint_legacy_revision)
+            &.{}
+        else
+            try decoder.ownedBytes(alloc, max_string_bytes);
+        errdefer if (params.len > 0) alloc.free(params);
+        const entry_bytes = uri.len + params.len;
+        if (uri.len == 0 or entry_bytes > maximum_bytes -| total) {
+            return error.InvalidEngineCheckpoint;
+        }
+        pool.appendAssumeCapacity(.{ .uri = uri, .params = params });
+        total += entry_bytes;
+    }
+    byte_count.* = total;
 }
 
 fn decodePool(
@@ -2851,6 +2936,20 @@ fn decodeOptionalIndex(decoder: *CheckpointDecoder) !?usize {
     if (!try decoder.boolean()) return null;
     return std.math.cast(usize, try decoder.int(u64)) orelse
         error.InvalidEngineCheckpoint;
+}
+
+fn validateHyperlinkPool(pool: []const HyperlinkResource, maximum_bytes: usize) !void {
+    var total: usize = 0;
+    for (pool) |link| {
+        const entry_bytes = link.uri.len + link.params.len;
+        if (link.uri.len == 0 or link.uri.len > max_string_bytes or
+            link.params.len > max_string_bytes or
+            entry_bytes > maximum_bytes -| total)
+        {
+            return error.InvalidEngineCheckpoint;
+        }
+        total += entry_bytes;
+    }
 }
 
 fn validatePool(pool: []const []u8, maximum_bytes: usize) !void {
@@ -3031,11 +3130,18 @@ fn cellsEqual(a_grid: Grid, a: Cell, b_grid: Grid, b: Cell) bool {
         return false;
     }
     if (a.combining_suffix_id == 0 or b.combining_suffix_id == 0) {
-        return a.combining_suffix_id == b.combining_suffix_id;
+        if (a.combining_suffix_id != b.combining_suffix_id) return false;
+    } else {
+        const a_suffix = a_grid.combiningSuffix(a.combining_suffix_id) orelse return false;
+        const b_suffix = b_grid.combiningSuffix(b.combining_suffix_id) orelse return false;
+        if (!std.mem.eql(u8, a_suffix, b_suffix)) return false;
     }
-    const a_suffix = a_grid.combiningSuffix(a.combining_suffix_id) orelse return false;
-    const b_suffix = b_grid.combiningSuffix(b.combining_suffix_id) orelse return false;
-    return std.mem.eql(u8, a_suffix, b_suffix);
+    if (a.style.hyperlink_id == 0) return true;
+    const a_url = a_grid.hyperlinkUrl(a.style.hyperlink_id) orelse return false;
+    const b_url = b_grid.hyperlinkUrl(b.style.hyperlink_id) orelse return false;
+    const a_params = a_grid.hyperlinkParams(a.style.hyperlink_id) orelse return false;
+    const b_params = b_grid.hyperlinkParams(b.style.hyperlink_id) orelse return false;
+    return std.mem.eql(u8, a_url, b_url) and std.mem.eql(u8, a_params, b_params);
 }
 
 fn hasShiftedWideCellOverlap(
@@ -3078,7 +3184,11 @@ fn emitHyperlinkTransition(out: *std.Io.Writer, grid: Grid, prev_id: u32, next_i
         if (prev_id != 0) try out.writeAll("\x1b]8;;\x1b\\");
         return;
     };
-    try emitHyperlinkOpen(out, &.{}, url);
+    const params = grid.hyperlinkParams(next_id) orelse {
+        if (prev_id != 0) try out.writeAll("\x1b]8;;\x1b\\");
+        return;
+    };
+    try emitHyperlinkOpen(out, params, url);
 }
 
 fn emitHyperlinkOpen(
@@ -3883,6 +3993,37 @@ test "presentation resume preserves OSC 8 parameters and close clears them" {
     try testing.expectEqualStrings("", closed_writer.written());
 }
 
+test "OSC 8 link identity survives row diffs and checkpoints" {
+    const alloc = testing.allocator;
+    var previous = try Grid.init(alloc, 20, 3);
+    defer previous.deinit();
+    var next = try previous.clone(alloc);
+    defer next.deinit();
+
+    const first = "\x1b]8;id=fx-1;https://example.com\x1b\\";
+    const second = "\x1b]8;id=fx-2;https://example.com\x1b\\";
+    const close = "\x1b]8;;\x1b\\";
+    try next.feed("\x1b[1;1H" ++ first ++ "abc" ++ close ++
+        "\x1b[2;1H" ++ first ++ "def" ++ close ++
+        "\x1b[3;1H" ++ second ++ "ghi" ++ close);
+    try testing.expectEqual(next.cellAt(1, 1).?.style.hyperlink_id, next.cellAt(2, 1).?.style.hyperlink_id);
+    try testing.expect(next.cellAt(1, 1).?.style.hyperlink_id != next.cellAt(3, 1).?.style.hyperlink_id);
+
+    const payload = try next.checkpointPayload(alloc);
+    defer alloc.free(payload);
+    var restored = try Grid.restoreCheckpoint(alloc, payload);
+    defer restored.deinit();
+    try testing.expectEqualStrings("id=fx-1", restored.hyperlinkParams(restored.cellAt(2, 1).?.style.hyperlink_id).?);
+    try testing.expectEqualStrings("id=fx-2", restored.hyperlinkParams(restored.cellAt(3, 1).?.style.hyperlink_id).?);
+
+    var writer: std.Io.Writer.Allocating = .init(alloc);
+    defer writer.deinit();
+    try Grid.diffTo(previous, restored, &writer.writer);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, writer.written(), first));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, writer.written(), second));
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, writer.written(), "\x1b]8;;https://example.com"));
+}
+
 test "OSC 8 parameter replacement is atomic on allocation failure" {
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
     const alloc = failing.allocator();
@@ -3908,7 +4049,9 @@ test "OSC 8 parameter replacement is atomic on allocation failure" {
 
     failing.fail_index = std.math.maxInt(usize);
     try source.feed("\x1b]8;id=fx-new;https://example.com\x1b\\");
-    try testing.expectEqual(@as(usize, 1), source.hyperlink_pool.items.len);
+    try testing.expectEqual(@as(usize, 2), source.hyperlink_pool.items.len);
+    try testing.expectEqualStrings("id=fx-old", source.hyperlinkParams(1).?);
+    try testing.expectEqualStrings("id=fx-new", source.hyperlinkParams(2).?);
 
     var new_resume_buf: [128]u8 = undefined;
     var new_resume: std.Io.Writer = .fixed(&new_resume_buf);
@@ -4341,6 +4484,84 @@ test "checkpoint round trip preserves complete fragmented parser state" {
     defer testing.allocator.free(fragmented_actual);
     try testing.expectEqualSlices(u8, expected, actual);
     try testing.expectEqualSlices(u8, expected, fragmented_actual);
+}
+
+test "checkpoint link pool rejects truncated params and combined capacity" {
+    const alloc = testing.allocator;
+    const uri = "https://example.com";
+    var encoder = CheckpointEncoder.init(alloc);
+    defer encoder.deinit();
+    try encoder.int(u32, 2);
+    try encoder.sizedBytes(uri);
+    try encoder.sizedBytes("id=a");
+    try encoder.sizedBytes(uri);
+    try encoder.sizedBytes("id=b");
+    const bytes = try encoder.finish();
+    defer alloc.free(bytes);
+
+    {
+        var pool: std.ArrayList(HyperlinkResource) = .empty;
+        defer {
+            for (pool.items) |link| link.deinit(alloc);
+            pool.deinit(alloc);
+        }
+        var count: usize = 0;
+        var decoder = CheckpointDecoder.init(bytes[0 .. bytes.len - 1]);
+        try testing.expectError(error.InvalidEngineCheckpoint, decodeHyperlinkPool(
+            &decoder,
+            alloc,
+            &pool,
+            &count,
+            checkpoint_schema_revision,
+            max_hyperlink_pool_bytes,
+        ));
+        try testing.expectEqual(@as(usize, 1), pool.items.len);
+    }
+
+    {
+        var pool: std.ArrayList(HyperlinkResource) = .empty;
+        defer {
+            for (pool.items) |link| link.deinit(alloc);
+            pool.deinit(alloc);
+        }
+        var count: usize = 0;
+        var decoder = CheckpointDecoder.init(bytes);
+        try testing.expectError(error.InvalidEngineCheckpoint, decodeHyperlinkPool(
+            &decoder,
+            alloc,
+            &pool,
+            &count,
+            checkpoint_schema_revision,
+            uri.len + "id=a".len,
+        ));
+        try testing.expectEqual(@as(usize, 1), pool.items.len);
+    }
+}
+
+test "revision one checkpoint restores URI-only links without params" {
+    const alloc = testing.allocator;
+    var grid = try Grid.init(alloc, 4, 2);
+    defer grid.deinit();
+    const uri = "https://example.com";
+    try grid.feed("\x1b]8;;" ++ uri ++ "\x1b\\X\x1b]8;;\x1b\\");
+    const current = try grid.checkpointPayload(alloc);
+    defer alloc.free(current);
+
+    // Revision one encoded only the URI; remove the revision-two empty params length.
+    const uri_start = std.mem.find(u8, current, uri) orelse return error.MissingTestUri;
+    const uri_end = uri_start + uri.len;
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, current[uri_end .. uri_end + 4]);
+    const legacy = try alloc.alloc(u8, current.len - 4);
+    defer alloc.free(legacy);
+    @memcpy(legacy[0..uri_end], current[0..uri_end]);
+    @memcpy(legacy[uri_end..], current[uri_end + 4 ..]);
+    std.mem.writeInt(u16, legacy[4..6], checkpoint_legacy_revision, .little);
+
+    var restored = try Grid.restoreCheckpoint(alloc, legacy);
+    defer restored.deinit();
+    const link_id = restored.cellAt(1, 1).?.style.hyperlink_id;
+    try testing.expectEqualStrings(uri, restored.hyperlinkUrl(link_id).?);
+    try testing.expectEqualStrings("", restored.hyperlinkParams(link_id).?);
 }
 
 test "checkpoint rejects unsupported revision corruption and trailing bytes" {

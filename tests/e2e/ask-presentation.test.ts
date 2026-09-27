@@ -549,7 +549,7 @@ describe("fx ask presentation", () => {
       const rows = pane.split("\n").filter((row) => row.includes("localhost:") || row.includes("3515."));
       expect(rows).toHaveLength(2);
       const escaped = await session.captureFullScrollbackEscapes();
-      const target = `\x1b]8;;${url}\x1b\\`;
+      const target = `\x1b]8;id=fx-1;${url}\x1b\\`;
       const linkedRows = escaped.split("\n").filter((row) => row.includes(target));
       expect(linkedRows).toHaveLength(2);
       expect(linkedRows[0]).toContain("localhost:");
