@@ -176,7 +176,7 @@ fn pageKeyAction(keycode: u16, modifiers: u16) InputEscapeAction {
 fn forwardDeleteKeyAction(modifiers: u16) InputEscapeAction {
     if ((modifiers & super_modifier) != 0) return .delete_to_line_end;
     if ((modifiers & (alt_modifier | ctrl_modifier)) != 0) return .delete_word_right;
-    return .delete_next;
+    return if (modifiers == 0) .delete_next else .ignore;
 }
 
 // Resolve a Kitty CSI u report (`ESC[<keycode>;<mod>u`). Shared by the
@@ -192,7 +192,7 @@ fn kittyUnicodeKeyAction(keycode: u16, modifiers: u16, meta_prefixed: bool) Inpu
         if (keypadCharacterKey(keycode)) |byte| {
             // Only a bare or Shift-modified keypad press types text, matching
             // the main row where modified digits and operators are not text.
-            if ((mods & ~shift_modifier) == 0) return .{ .remapped_byte = byte };
+            if (!meta_prefixed and (mods & ~shift_modifier) == 0) return .{ .remapped_byte = byte };
         } else if (keypadNavigationKey(keycode)) |letter| {
             return navigationKeyAction(letter, mods, meta_prefixed);
         } else if (keycode == kp_page_up or keycode == kp_page_down) {
@@ -695,12 +695,7 @@ pub fn consumeInputEscapeByteWithMouse(
                 const keycode = param2.*;
                 const modifiers = if (param.* > 0) param.* - 1 else 0;
                 resetMouseEscapeDecode(stage, param, param2, mouse);
-                if (keycode == 3 and (modifiers & 0x08) != 0) {
-                    return .delete_to_line_end;
-                }
-                if (keycode == 3 and ((modifiers & 0x02) != 0 or (modifiers & 0x04) != 0)) {
-                    return .delete_word_right;
-                }
+                if (keycode == 3) return forwardDeleteKeyAction(modifiers);
                 if (modifiers != 0) return switch (keycode) {
                     1, 7 => composerMove(
                         if ((modifiers & ctrl_modifier) != 0) .draft_start else .line_start,
@@ -716,7 +711,6 @@ pub fn consumeInputEscapeByteWithMouse(
                 };
                 return switch (keycode) {
                     1, 7 => .home,
-                    3 => .delete_next,
                     4, 8 => .end,
                     5 => .page_up,
                     6 => .page_down,

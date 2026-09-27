@@ -2098,6 +2098,8 @@ test "input escape parser maps kitty keypad keys to their main-row characters" {
     try expectEscapeAction("[57412;9u", .ignore);
     try expectEscapeAction("[57412;17u", .ignore);
     try expectEscapeAction("[57412;33u", .ignore);
+    try expectEscapeAction("\x1b[57412u", .ignore);
+    try expectEscapeAction("\x1b[57412;2u", .ignore);
 }
 
 test "input escape parser keeps keypad Enter, navigation, and Delete contracts" {
@@ -2117,9 +2119,15 @@ test "input escape parser keeps keypad Enter, navigation, and Delete contracts" 
     try expectEscapeAction("[57421u", .page_up);
     try expectEscapeAction("[57422u", .page_down);
     try expectEscapeAction("[57426u", .delete_next);
+    try expectEscapeAction("[3;1~", .delete_next);
+    try expectEscapeAction("[57426;2u", .ignore);
+    try expectEscapeAction("[3;2~", .ignore);
     try expectEscapeAction("[57426;3u", .delete_word_right);
+    try expectEscapeAction("[3;3~", .delete_word_right);
     try expectEscapeAction("[57426;5u", .delete_word_right);
+    try expectEscapeAction("[3;5~", .delete_word_right);
     try expectEscapeAction("[57426;9u", .delete_to_line_end);
+    try expectEscapeAction("[3;9~", .delete_to_line_end);
     // Keypad keys with no main-row equivalent stay unmapped.
     try expectEscapeAction("[57416u", .ignore);
     try expectEscapeAction("[57425u", .ignore);
