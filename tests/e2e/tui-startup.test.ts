@@ -11,7 +11,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { FX_BIN, HAS_API_KEY } from "../evals/eval-helpers";
-import { hasEmptyComposer, TmuxSession, tmuxAvailable } from "./tmux-helpers";
+import {
+  FAKE_GATEWAY_MODEL,
+  fakeGatewayFinalText,
+  hasEmptyComposer,
+  startDynamicFakeGateway,
+  TmuxSession,
+  tmuxAvailable,
+} from "./tmux-helpers";
 
 const SKIP = !tmuxAvailable() || !HAS_API_KEY;
 const SKIP_TMUX = !tmuxAvailable();
@@ -352,6 +359,62 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
           await session.kill();
           session = null;
         }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "/new keeps a completed reply in scrollback and starts the next prompt fresh",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-reply-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+      const gateway = startDynamicFakeGateway(() => fakeGatewayFinalText("FIXTURE_REPLY_OK"));
+      const version = execFileSync(FX_BIN, ["--version"], { encoding: "utf8" }).trim();
+      const banner = `𝒇x v${version} · Run /help for commands`;
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: {
+            HOME: home,
+            FX_AUTO_UPGRADE: "0",
+            AI_GATEWAY_API_KEY: "new-fixture-key",
+            VERCEL_OIDC_TOKEN: undefined,
+            FX_GATEWAY_BASE_URL: gateway.baseUrl,
+            FX_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_E2E_GATEWAY_CHAT_URL: gateway.chatUrl,
+            FX_MODEL: FAKE_GATEWAY_MODEL,
+          },
+          stderrPath,
+          width: 100,
+          height: 24,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("first fixture prompt");
+        await session.waitForText("FIXTURE_REPLY_OK", 10_000);
+        await session.sendText("/new");
+        await session.waitForPane((pane) => pane.includes(banner) && hasEmptyComposer(pane), 10_000);
+        const history = await session.captureFullScrollback();
+        expect(history.lastIndexOf("FIXTURE_REPLY_OK")).toBeLessThan(history.lastIndexOf(banner));
+        expect(history).toContain("FIXTURE_REPLY_OK");
+
+        await session.sendText("second fixture prompt");
+        await session.waitForText("FIXTURE_REPLY_OK", 10_000);
+        expect(gateway.requests).toHaveLength(2);
+        expect(gateway.requests[1].body).toContain("second fixture prompt");
+        expect(gateway.requests[1].body).not.toContain("first fixture prompt");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        gateway.stop();
         rmSync(root, { recursive: true, force: true });
       }
     },

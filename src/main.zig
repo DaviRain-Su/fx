@@ -2834,12 +2834,40 @@ const App = struct {
     }
 
     fn handleTerminalInputByte(self: *App, byte: u8) !void {
+        if (self.session_persistence.pending_live_session_policy != null) {
+            if (try self.terminal_input_runtime.deferSessionInputByte(self.alloc, byte, input_limits.composer_bytes)) return;
+            try SessionAppRuntime.cancelPendingLiveSessionForInputLimit(self);
+        }
+        _ = try self.flushDeferredSessionInput();
+        if (self.should_exit) return;
+        if (self.session_persistence.pending_live_session_policy != null) {
+            if (try self.terminal_input_runtime.deferSessionInputByte(self.alloc, byte, input_limits.composer_bytes)) return;
+            try SessionAppRuntime.cancelPendingLiveSessionForInputLimit(self);
+            _ = try self.flushDeferredSessionInput();
+            if (self.should_exit) return;
+        }
+        try self.decodeTerminalInputByte(byte);
+    }
+
+    fn decodeTerminalInputByte(self: *App, byte: u8) !void {
         const context = try InputAppRuntime.prepareTerminalDecode(self) orelse return;
-        const ingress = self.terminal_input_runtime.decodeTerminalByte(
-            byte,
-            context,
-        );
+        const ingress = self.terminal_input_runtime.decodeTerminalByte(byte, context);
         try self.routeTerminalInputIngress(ingress);
+    }
+
+    fn flushDeferredSessionInput(self: *App) !bool {
+        var delivered = false;
+        while (!self.should_exit and self.session_persistence.pending_live_session_policy == null) {
+            const byte = self.terminal_input_runtime.takeDeferredSessionInputByte() orelse break;
+            delivered = true;
+            if (try self.routeActivePasteTransportByte(byte)) continue;
+            try self.decodeTerminalInputByte(byte);
+        }
+        if (self.should_exit) {
+            const dropped = self.terminal_input_runtime.discardDeferredSessionInput();
+            if (dropped > 0) debug_trace.logf("input", "deferred session input dropped bytes={d} reason=quit", .{dropped});
+        }
+        return delivered;
     }
 
     fn routeTerminalInputIngress(
@@ -3169,9 +3197,12 @@ const App = struct {
                 if (self.shell.sessionScrollbackHandoffPending()) return;
             }
         }
+        _ = try self.flushDeferredSessionInput();
+        if (self.should_exit) return;
         try self.flushRequestedFrame();
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.settlePendingLiveSessionTransition(self);
+            if (try self.flushDeferredSessionInput()) try self.flushRequestedFrame();
         }
     }
 
@@ -4127,14 +4158,85 @@ test "partial session handoff resize cancels the pending transition without exit
     };
     app.shell.layout.cols = 78;
     app.shell.render_requests.observeResizeSignal(100, 100);
+    const worker_alloc = std.heap.c_allocator;
+    try app.worker.enqueueContextCompaction(.{
+        .model = try worker_alloc.dupe(u8, "test/model"),
+        .api_key = try worker_alloc.dupe(u8, "test-key"),
+        .history = &.{},
+    });
+    app.worker.holdSessionTransition();
+    try std.testing.expect((try app.worker.tryTakeNextWork(worker_alloc)) == null);
 
     try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
 
     try std.testing.expect(app.session_persistence.pending_live_session_policy == null);
+    try std.testing.expect(!app.worker.session_transition_held);
+    try std.testing.expect(app.worker.queued_context_compaction != null);
     try std.testing.expect(!app.shell.sessionScrollbackHandoffPending());
     try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "old session retained") != null);
     try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "Session change cancelled") != null);
     try std.testing.expect(app.shell.render_requests.hasPending());
+}
+
+test "deferred session transition replays later input only after the fresh session installs" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    app.session_persistence.pending_live_session_policy = .carry_forward;
+    app.worker.holdSessionTransition();
+
+    for ("hello") |byte| try app.handleTerminalInputByte(byte);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expectEqualStrings("hello", app.terminal_input_runtime.deferred_session_input.items);
+
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
+    try std.testing.expect(app.session_persistence.pending_live_session_policy == null);
+    try std.testing.expect(!app.worker.session_transition_held);
+    try std.testing.expect(try app.flushDeferredSessionInput());
+    try std.testing.expectEqualStrings("hello", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInputByte() == null);
+}
+
+test "deferred session input stops replay after quit" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    app.session_persistence.pending_live_session_policy = .carry_forward;
+    app.worker.holdSessionTransition();
+    for ("/quit\r/status\r") |byte| try app.handleTerminalInputByte(byte);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
+    try std.testing.expect(try app.flushDeferredSessionInput());
+    try std.testing.expect(app.should_exit);
+    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInputByte() == null);
+    try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "* status:") == null);
 }
 
 test "raw benchmark preflight matches no-arg FX_BENCH presence" {

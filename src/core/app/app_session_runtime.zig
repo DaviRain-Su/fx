@@ -1554,6 +1554,10 @@ pub fn Runtime(comptime App: type) type {
             app: *App,
             background_policy: BackgroundSessionPolicy,
         ) !void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "holdSessionTransition")) {
+                app.worker.holdSessionTransition();
+            }
+            errdefer releaseLiveSessionTransitionHold(app);
             const previous_policy = app.session_persistence.pending_live_session_policy;
             const decision = decideLiveSessionTransition(
                 runtime_profile.allows(App, .cooperative_agent),
@@ -1585,7 +1589,7 @@ pub fn Runtime(comptime App: type) type {
                         return err;
                     };
                 },
-                .cancel_and_defer => beginLiveSessionCancellation(app),
+                .cancel_and_defer => app.worker.requestCancel(),
                 .none => {},
                 .apply_pending => unreachable,
             }
@@ -1618,12 +1622,13 @@ pub fn Runtime(comptime App: type) type {
                 error.SessionScrollbackHandoffGeometryChanged => {
                     app.session_persistence.pending_live_session_policy = null;
                     app.shell.cancelSessionScrollbackHandoff();
+                    releaseLiveSessionTransitionHold(app);
                     debug_trace.logf("session", "event=live_session_transition_cancelled reason=scrollback_handoff_geometry_changed", .{});
                     if (comptime @hasDecl(App, "writeDomainNotice")) {
                         app.writeDomainNotice(.{
                             .topic = "session",
                             .tone = .warning,
-                            .body = "Session change cancelled after a terminal resize. The session was not reset, but queued work may have been cancelled. Retry the command.",
+                            .body = "Session change cancelled after a terminal resize. The old session was kept; an active turn may have been cancelled. Retry the command.",
                         }, true) catch |notice_err| {
                             debug_trace.logf("session", "event=transition_cancel_notice_dropped err={s}", .{@errorName(notice_err)});
                         };
@@ -1634,8 +1639,22 @@ pub fn Runtime(comptime App: type) type {
             }
         }
 
+        pub fn cancelPendingLiveSessionForInputLimit(app: *App) !void {
+            if (app.session_persistence.pending_live_session_policy == null) return;
+            app.session_persistence.pending_live_session_policy = null;
+            app.shell.cancelSessionScrollbackHandoff();
+            releaseLiveSessionTransitionHold(app);
+            debug_trace.logf("session", "event=live_session_transition_cancelled reason=deferred_input_limit", .{});
+            try app.writeDomainNotice(.{
+                .topic = "session",
+                .tone = .warning,
+                .body = "Session change cancelled because input arrived faster than it could finish. Your input is still being delivered to the old session; retry the command.",
+            }, true);
+        }
+
         pub fn settlePendingLiveSessionTransition(app: *App) !void {
             if (app.session_persistence.pending_live_session_policy == null) return;
+            errdefer releaseLiveSessionTransitionHold(app);
             const decision = decideLiveSessionTransition(
                 runtime_profile.allows(App, .cooperative_agent),
                 app.worker.isProcessing(),
@@ -1676,9 +1695,16 @@ pub fn Runtime(comptime App: type) type {
         }
 
         fn installFreshLiveSession(app: *App) !void {
+            defer releaseLiveSessionTransitionHold(app);
             try beginFreshPersistedSession(app);
             enableSessionStores(app);
             try finishLiveSessionTransition(app);
+        }
+
+        fn releaseLiveSessionTransitionHold(app: *App) void {
+            if (comptime @hasDecl(@TypeOf(app.worker), "releaseSessionTransitionHold")) {
+                app.worker.releaseSessionTransitionHold();
+            }
         }
 
         pub fn prepareLiveSessionResume(app: *App) !void {
@@ -1695,7 +1721,11 @@ pub fn Runtime(comptime App: type) type {
             background_policy: BackgroundSessionPolicy,
             preserve_scrollback: bool,
         ) !void {
-            beginLiveSessionCancellation(app);
+            if (preserve_scrollback) {
+                app.worker.requestCancel();
+            } else {
+                beginLiveSessionCancellation(app);
+            }
             app.worker.waitUntilIdle();
             try applyIdleLiveSessionTransition(app, background_policy, preserve_scrollback);
         }
@@ -1734,6 +1764,7 @@ pub fn Runtime(comptime App: type) type {
                 }
                 if (!freshSessionResizeReady(app)) return error.SessionScrollbackHandoffUnavailable;
                 try app.shell.commitVisibleTranscriptBeforeFreshSession(app.alloc, &app.metrics);
+                beginLiveSessionCancellation(app);
             }
             retireLiveSessionCompaction(app);
             clearCachedSessionTitle(app);
