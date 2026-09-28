@@ -4284,12 +4284,12 @@ test "deferred paste settles before input from the next delivery epoch" {
     try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
     try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
     try std.testing.expect(!app.input_runtime.paste.active());
-    try std.testing.expect(app.input_runtime.edit_state.input.items.len > 0);
-    for ("\r") |byte| try app.handleTerminalInputByte(byte);
-    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
-    _ = try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history);
+    const pasted_input_len = app.input_runtime.edit_state.input.items.len;
+    try std.testing.expect(pasted_input_len > 0);
+    try app.handleTerminalInputByte('x');
     app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app);
     try std.testing.expect(!app.input_runtime.paste.active());
+    try std.testing.expect(app.input_runtime.edit_state.input.items.len > pasted_input_len);
 }
 
 test "stalled fresh-session handoff replays Ctrl+C after timeout" {
