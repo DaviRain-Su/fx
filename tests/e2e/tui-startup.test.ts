@@ -489,6 +489,54 @@ describe.skipIf(SKIP_TMUX)("tui: fresh-session commands", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "/quit exits after a fresh-session handoff times out at an invalid terminal size",
+    async () => {
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "fx-e2e-new-invalid-size-")));
+      const home = join(root, "home");
+      const stderrPath = join(root, "stderr.log");
+      const tracePath = join(root, "trace.log");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(stderrPath, "");
+
+      try {
+        session = await TmuxSession.create({
+          cwd: root,
+          env: { HOME: home, FX_AUTO_UPGRADE: "0", FX_TRACE_LOG: tracePath },
+          stderrPath,
+          width: 80,
+          height: 18,
+        });
+        await session.waitForComposer(10_000);
+        await session.sendText("/status");
+        await session.waitForText("agent_step_limit=0", 5_000);
+        session.sendLiteralImmediate("/new");
+        await session.resizeWindow(78, 3, 0);
+        session.sendKeysImmediate(["Enter"]);
+
+        let trace = "";
+        for (let attempt = 0; attempt < 100; attempt++) {
+          trace = readFileSync(tracePath, "utf8");
+          if (trace.includes("live_session_transition_deferred")) break;
+          await Bun.sleep(25);
+        }
+        expect(trace).toContain("live_session_transition_deferred");
+        session.sendLiteralImmediate("/quit");
+        session.sendKeysImmediate(["Enter"]);
+        expect(await session.waitForSessionEnd(5_000)).toBe(true);
+        expect(readFileSync(tracePath, "utf8")).toContain("live_session_transition_cancelled reason=resize_timeout");
+        expect(readFileSync(stderrPath, "utf8")).toBe("");
+      } finally {
+        if (session) {
+          await session.kill();
+          session = null;
+        }
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TIMEOUT,
+  );
 });
 
 describe.skipIf(SKIP_TMUX)("tui: MCP startup", () => {

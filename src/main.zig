@@ -1140,6 +1140,7 @@ const App = struct {
 
     fn processNextCooperativePrompt(self: *App) !void {
         if (comptime !host_target.is_wasm) return;
+        defer SessionAppRuntime.finishDeferredSessionInputReplay(self);
         try app_process_runtime.Runtime(App).processNextCooperativePrompt(
             self,
             app_callbacks.Bindings(App).workerEventHandlers(self),
@@ -2834,40 +2835,12 @@ const App = struct {
     }
 
     fn handleTerminalInputByte(self: *App, byte: u8) !void {
-        if (self.session_persistence.pending_live_session_policy != null) {
-            if (try self.terminal_input_runtime.deferSessionInputByte(self.alloc, byte, input_limits.composer_bytes)) return;
-            try SessionAppRuntime.cancelPendingLiveSessionForInputLimit(self);
-        }
-        _ = try self.flushDeferredSessionInput();
-        if (self.should_exit) return;
-        if (self.session_persistence.pending_live_session_policy != null) {
-            if (try self.terminal_input_runtime.deferSessionInputByte(self.alloc, byte, input_limits.composer_bytes)) return;
-            try SessionAppRuntime.cancelPendingLiveSessionForInputLimit(self);
-            _ = try self.flushDeferredSessionInput();
-            if (self.should_exit) return;
-        }
-        try self.decodeTerminalInputByte(byte);
-    }
-
-    fn decodeTerminalInputByte(self: *App, byte: u8) !void {
-        const context = try InputAppRuntime.prepareTerminalDecode(self) orelse return;
-        const ingress = self.terminal_input_runtime.decodeTerminalByte(byte, context);
-        try self.routeTerminalInputIngress(ingress);
-    }
-
-    fn flushDeferredSessionInput(self: *App) !bool {
-        var delivered = false;
-        while (!self.should_exit and self.session_persistence.pending_live_session_policy == null) {
-            const byte = self.terminal_input_runtime.takeDeferredSessionInputByte() orelse break;
-            delivered = true;
-            if (try self.routeActivePasteTransportByte(byte)) continue;
-            try self.decodeTerminalInputByte(byte);
-        }
-        if (self.should_exit) {
-            const dropped = self.terminal_input_runtime.discardDeferredSessionInput();
-            if (dropped > 0) debug_trace.logf("input", "deferred session input dropped bytes={d} reason=quit", .{dropped});
-        }
-        return delivered;
+        try InputAppRuntime.handleTerminalByteAcrossSessionTransition(
+            self,
+            byte,
+            input_limits,
+            max_prompt_history,
+        );
     }
 
     fn routeTerminalInputIngress(
@@ -3187,6 +3160,7 @@ const App = struct {
 
     pub fn loopCommitFrame(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        defer SessionAppRuntime.finishDeferredSessionInputReplay(self);
         if (!try WorkerAppRuntime.authorizeInteractiveAdmission(self)) return;
         if (self.terminal_input_runtime.native_clear_probe.active()) return;
         _ = self.admitPendingResizeSignal("post_input");
@@ -3197,12 +3171,12 @@ const App = struct {
                 if (self.shell.sessionScrollbackHandoffPending()) return;
             }
         }
-        _ = try self.flushDeferredSessionInput();
+        _ = try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history);
         if (self.should_exit) return;
         try self.flushRequestedFrame();
         if (comptime !host_target.is_wasm) {
             try SessionAppRuntime.settlePendingLiveSessionTransition(self);
-            if (try self.flushDeferredSessionInput()) try self.flushRequestedFrame();
+            if (try InputAppRuntime.flushDeferredSessionInput(self, input_limits, max_prompt_history)) try self.flushRequestedFrame();
         }
     }
 
@@ -3344,6 +3318,7 @@ const App = struct {
 
     pub fn loopSettleInputDeliveryEpoch(ctx: *anyopaque) !void {
         const self: *App = @ptrCast(@alignCast(ctx));
+        try self.terminal_input_runtime.markDeferredSessionDeliveryEpoch(self.alloc);
         if (!InputAppRuntime.terminalPasteActive(self)) return;
         try InputAppRuntime.settleTerminalPasteDeliveryEpochWithLimits(
             self,
@@ -4200,14 +4175,17 @@ test "deferred session transition replays later input only after the fresh sessi
 
     for ("hello") |byte| try app.handleTerminalInputByte(byte);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
-    try std.testing.expectEqualStrings("hello", app.terminal_input_runtime.deferred_session_input.items);
+    try std.testing.expectEqual(@as(usize, 5), app.terminal_input_runtime.deferred_session_input.items.len);
+    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
 
     try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
     try std.testing.expect(app.session_persistence.pending_live_session_policy == null);
+    try std.testing.expect(app.worker.session_transition_held);
+    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
+    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app);
     try std.testing.expect(!app.worker.session_transition_held);
-    try std.testing.expect(try app.flushDeferredSessionInput());
     try std.testing.expectEqualStrings("hello", app.input_runtime.edit_state.input.items);
-    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInputByte() == null);
+    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
 }
 
 test "deferred session input stops replay after quit" {
@@ -4229,14 +4207,182 @@ test "deferred session input stops replay after quit" {
     defer app.deinit();
     app.session_persistence.pending_live_session_policy = .carry_forward;
     app.worker.holdSessionTransition();
-    for ("/quit\r/status\r") |byte| try app.handleTerminalInputByte(byte);
+    for ("/quit\r/status\r") |byte| {
+        try std.testing.expect(try app.terminal_input_runtime.deferSessionInputByte(alloc, byte, App.input_limits.composer_bytes));
+    }
+    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
 
     try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
-    try std.testing.expect(try app.flushDeferredSessionInput());
+    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
+    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app);
+    try std.testing.expect(!app.worker.session_transition_held);
     try std.testing.expect(app.should_exit);
-    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInputByte() == null);
+    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
     try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "* status:") == null);
+}
+
+test "deferred paste settles before input from the next delivery epoch" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    app.session_persistence.pending_live_session_policy = .carry_forward;
+    app.worker.holdSessionTransition();
+    for ("\x1b[200~hello\x1b[201~") |byte| try app.handleTerminalInputByte(byte);
+    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
+    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
+    try std.testing.expect(!app.input_runtime.paste.active());
+    try std.testing.expect(app.input_runtime.edit_state.input.items.len > 0);
+    for ("\r") |byte| try app.handleTerminalInputByte(byte);
+    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
+    _ = try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history);
+    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app);
+    try std.testing.expect(!app.input_runtime.paste.active());
+}
+
+test "stalled fresh-session handoff replays Ctrl+C after timeout" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    try app.shell.initBacking(alloc);
+    try app.shell.enableShadowVt(alloc);
+    try app.shell.writeTranscript(alloc, &app.metrics, "old session retained\n", true);
+    app.shell.has_committed_frame = true;
+    app.shell.render_requests.observeResizeSignal(100, 100);
+    try app.newSession();
+    try std.testing.expect(app.session_persistence.pending_live_session_policy != null);
+    try std.testing.expect(app.worker.session_transition_held);
+
+    const worker_alloc = std.heap.c_allocator;
+    try app.worker.enqueueContextCompaction(.{
+        .model = try worker_alloc.dupe(u8, "test/model"),
+        .api_key = try worker_alloc.dupe(u8, "test-key"),
+        .history = &.{},
+    });
+    for ("draft") |byte| try app.handleTerminalInputByte(byte);
+    for ("\x1b[99;5u") |byte| try app.handleTerminalInputByte(byte);
+    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
+    try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
+    try std.testing.expect(app.worker.queued_context_compaction != null);
+    app.session_persistence.pending_live_session_started_ms = 1;
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
+    try std.testing.expect(app.session_persistence.pending_live_session_policy == null);
+    try std.testing.expect(app.worker.session_transition_held);
+    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
+    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app);
+
+    try std.testing.expect(!app.worker.session_transition_held);
+    try std.testing.expect(app.worker.queued_context_compaction == null);
+    try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "old session retained") != null);
+    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
+    try std.testing.expect(!app.should_exit);
+}
+
+test "replayed new command retains the worker hold through a second deferred transition" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    try app.shell.enableShadowVt(alloc);
+    app.shell.has_committed_frame = true;
+    app.shell.render_requests.observeResizeSignal(100, 100);
+    try app.newSession();
+
+    const worker_alloc = std.heap.c_allocator;
+    try app.worker.enqueueContextCompaction(.{
+        .model = try worker_alloc.dupe(u8, "test/model"),
+        .api_key = try worker_alloc.dupe(u8, "test-key"),
+        .history = &.{},
+    });
+    for ("/new\r") |byte| try app.handleTerminalInputByte(byte);
+    try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
+    app.session_persistence.pending_live_session_started_ms = 1;
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
+    try std.testing.expect(app.worker.session_transition_held);
+    try std.testing.expect((try app.worker.tryTakeNextWork(worker_alloc)) == null);
+
+    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
+    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app);
+    try std.testing.expect(app.session_persistence.pending_live_session_policy != null);
+    try std.testing.expect(app.worker.session_transition_held);
+    try std.testing.expect(app.worker.queued_context_compaction != null);
+    try std.testing.expect((try app.worker.tryTakeNextWork(worker_alloc)) == null);
+}
+
+test "quit exits after a timed-out handoff without a completed input epoch" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    try app.shell.enableShadowVt(alloc);
+    app.shell.has_committed_frame = true;
+    app.shell.render_requests.observeResizeSignal(100, 100);
+    try app.newSession();
+    for ("/quit\r") |byte| try app.handleTerminalInputByte(byte);
+    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
+    try std.testing.expect(app.session_persistence.pending_live_session_policy != null);
+    app.session_persistence.pending_live_session_started_ms = 1;
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
+    try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
+    app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app);
+
+    try std.testing.expect(app.should_exit);
+    try std.testing.expect(app.session_persistence.pending_live_session_policy == null);
+    try std.testing.expect(!app.worker.session_transition_held);
+    try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
 }
 
 test "raw benchmark preflight matches no-arg FX_BENCH presence" {

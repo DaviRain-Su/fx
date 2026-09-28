@@ -572,12 +572,18 @@ test "text edits undo and redo without snapshotting structured state" {
     try std.testing.expectEqualStrings("ab", runtime.edit_state.input.items);
 }
 
+pub const DeferredSessionInput = union(enum) {
+    byte: u8,
+    delivery_epoch,
+};
+
 pub const Runtime = struct {
     terminal_cursor_probe: cursor_probe.Parser = .{},
     terminal_theme_monitor: theme_monitor.Monitor = .{},
     deferred_terminal_input_source: ?DeferredTerminalInputSource = null,
-    deferred_session_input: std.ArrayList(u8) = .empty,
+    deferred_session_input: std.ArrayList(DeferredSessionInput) = .empty,
     deferred_session_input_index: usize = 0,
+    deferred_session_completed_end: usize = 0,
     native_clear_probe: native_clear_probe_runtime.Runtime = .{},
     terminal_action_decoder: terminal_action_decoder.Decoder = .{},
 
@@ -588,33 +594,54 @@ pub const Runtime = struct {
         self.native_clear_probe.deinit(alloc);
     }
 
+    pub fn hasDeferredSessionInput(self: *const Runtime) bool {
+        return self.deferred_session_input_index < self.deferred_session_input.items.len;
+    }
+
     pub fn deferSessionInputByte(self: *Runtime, alloc: Allocator, byte: u8, limit: usize) !bool {
         if (self.deferred_session_input.items.len - self.deferred_session_input_index >= limit) return false;
         if (self.deferred_session_input_index > 0) {
             const remaining = self.deferred_session_input.items[self.deferred_session_input_index..];
-            std.mem.copyForwards(u8, self.deferred_session_input.items[0..remaining.len], remaining);
+            std.mem.copyForwards(DeferredSessionInput, self.deferred_session_input.items[0..remaining.len], remaining);
             self.deferred_session_input.items.len = remaining.len;
+            self.deferred_session_completed_end -|= self.deferred_session_input_index;
             self.deferred_session_input_index = 0;
         }
-        try self.deferred_session_input.append(alloc, byte);
+        try self.deferred_session_input.append(alloc, .{ .byte = byte });
         return true;
     }
 
-    pub fn takeDeferredSessionInputByte(self: *Runtime) ?u8 {
+    pub fn markDeferredSessionDeliveryEpoch(self: *Runtime, alloc: Allocator) !void {
+        if (!self.hasDeferredSessionInput() or self.deferred_session_input.items[self.deferred_session_input.items.len - 1] == .delivery_epoch) return;
+        try self.deferred_session_input.append(alloc, .delivery_epoch);
+        self.deferred_session_completed_end = self.deferred_session_input.items.len;
+    }
+
+    pub fn allowCurrentDeferredSessionInputForReplay(self: *Runtime) void {
+        self.deferred_session_completed_end = self.deferred_session_input.items.len;
+    }
+
+    pub fn takeDeferredSessionInput(self: *Runtime) ?DeferredSessionInput {
         if (self.deferred_session_input_index == self.deferred_session_input.items.len) {
             self.deferred_session_input.clearRetainingCapacity();
             self.deferred_session_input_index = 0;
+            self.deferred_session_completed_end = 0;
             return null;
         }
-        const byte = self.deferred_session_input.items[self.deferred_session_input_index];
+        if (self.deferred_session_input_index >= self.deferred_session_completed_end) return null;
+        const item = self.deferred_session_input.items[self.deferred_session_input_index];
         self.deferred_session_input_index += 1;
-        return byte;
+        return item;
     }
 
     pub fn discardDeferredSessionInput(self: *Runtime) usize {
-        const dropped = self.deferred_session_input.items.len - self.deferred_session_input_index;
+        var dropped: usize = 0;
+        for (self.deferred_session_input.items[self.deferred_session_input_index..]) |item| {
+            if (item == .byte) dropped += 1;
+        }
         self.deferred_session_input.clearRetainingCapacity();
         self.deferred_session_input_index = 0;
+        self.deferred_session_completed_end = 0;
         return dropped;
     }
 
@@ -687,17 +714,23 @@ pub const Runtime = struct {
     }
 };
 
-test "deferred session input preserves order and enforces a byte limit" {
+test "deferred session input preserves delivery epochs and enforces a byte limit" {
     var runtime: Runtime = .{};
     defer runtime.deinit(std.testing.allocator);
     try std.testing.expect(try runtime.deferSessionInputByte(std.testing.allocator, 'a', 2));
     try std.testing.expect(try runtime.deferSessionInputByte(std.testing.allocator, 'b', 2));
     try std.testing.expect(!(try runtime.deferSessionInputByte(std.testing.allocator, 'c', 2)));
-    try std.testing.expectEqual(@as(?u8, 'a'), runtime.takeDeferredSessionInputByte());
+    try std.testing.expect(runtime.takeDeferredSessionInput() == null);
+    try runtime.markDeferredSessionDeliveryEpoch(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 'a'), runtime.takeDeferredSessionInput().?.byte);
+    try std.testing.expectEqual(@as(u8, 'b'), runtime.takeDeferredSessionInput().?.byte);
+    try std.testing.expect(runtime.takeDeferredSessionInput().? == .delivery_epoch);
+    try std.testing.expect(runtime.takeDeferredSessionInput() == null);
     try std.testing.expect(try runtime.deferSessionInputByte(std.testing.allocator, 'c', 2));
-    try std.testing.expectEqual(@as(?u8, 'b'), runtime.takeDeferredSessionInputByte());
-    try std.testing.expectEqual(@as(?u8, 'c'), runtime.takeDeferredSessionInputByte());
-    try std.testing.expectEqual(@as(?u8, null), runtime.takeDeferredSessionInputByte());
+    try runtime.markDeferredSessionDeliveryEpoch(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 'c'), runtime.takeDeferredSessionInput().?.byte);
+    try std.testing.expect(runtime.takeDeferredSessionInput().? == .delivery_epoch);
+    try std.testing.expect(runtime.takeDeferredSessionInput() == null);
 }
 
 pub fn scanInputCursorVertical(
