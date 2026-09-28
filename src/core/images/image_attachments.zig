@@ -1199,11 +1199,15 @@ fn waitForImageNormalizer(
 
 /// Kills a resizer that is still running, then waits for the pending wait
 /// task to collect it. Canceling that task instead would leave the process
-/// running and never collected, free to write its output later.
+/// running and never collected, free to write its output later. Cancelation
+/// of the calling task stays pending until the process is collected.
 fn stopImageNormalizer(
     select: *std.Io.Select(ImageNormalizerEvent),
     pid: std.process.Child.Id,
 ) void {
+    const io = io_mod.getIo();
+    const cancel_protection = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(cancel_protection);
     std.posix.kill(pid, .KILL) catch |err| debug_trace.logf(
         "images",
         "event=image_normalizer_kill_failed err={s}",
@@ -3839,12 +3843,12 @@ test "capture stops a platform resizer that runs past its time limit" {
     defer tmp.cleanup();
     const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
     defer alloc.free(root);
-    // The resizer records its process id, then writes its output after the
+    // The resizer records its process id, then leaves a marker after the
     // time limit, as a stuck resizer that recovers late would.
     const script = try std.fmt.allocPrint(
         alloc,
-        "echo $$ > '{s}/resizer.pid'; sleep 1; printf late > \"$2\"",
-        .{root},
+        "echo $$ > '{s}/resizer.pid'; sleep 1; printf late > '{s}/late.marker'",
+        .{ root, root },
     );
     defer alloc.free(script);
     const jpeg = image_data.testJpeg(3420, 2224);
@@ -3862,6 +3866,11 @@ test "capture stops a platform resizer that runs past its time limit" {
     defer alloc.free(pid_text);
     const pid = try std.fmt.parseInt(std.posix.pid_t, std.mem.trimEnd(u8, pid_text, "\n"), 10);
     try std.testing.expectError(error.ProcessNotFound, std.posix.kill(pid, @enumFromInt(0)));
+    // Waiting for the resizer to finish on its own would leave the marker
+    // before capture returns; a resizer left running would leave it later.
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "late.marker", .{}));
+    try std.testing.io.sleep(.fromMilliseconds(1500), .awake);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(std.testing.io, "late.marker", .{}));
     try std.testing.expectEqual(@as(usize, 1), try countSnapshotFiles(snapshot_dir));
 }
 
