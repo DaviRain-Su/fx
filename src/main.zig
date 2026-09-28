@@ -4222,6 +4222,42 @@ test "deferred session input stops replay after quit" {
     try std.testing.expect(std.mem.find(u8, app.shell.transcript.items, "* status:") == null);
 }
 
+test "active native turn cancels before resize-deferred session handoff" {
+    const alloc = std.testing.allocator;
+    var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
+    defer sink.close(io_mod.getIo());
+    var app = App{
+        .alloc = alloc,
+        .shell = .{ .stdout_file = sink, .layout = .{
+            .rows = 24,
+            .cols = 80,
+            .content_bottom = 21,
+            .divider_top_row = 22,
+            .input_row = 23,
+            .divider_bottom_row = 24,
+            .hint_row = 22,
+        } },
+    };
+    defer app.deinit();
+    try app.shell.enableShadowVt(alloc);
+    app.shell.has_committed_frame = true;
+    app.shell.render_requests.observeResizeSignal(100, 100);
+    app.worker.worker_processing = true;
+    try app.newSession();
+    try std.testing.expect(app.session_persistence.pending_live_session_policy != null);
+    try std.testing.expect(app.session_persistence.pending_live_session_wait.? == .worker);
+    try std.testing.expect(app.worker.isCancelRequested());
+    try std.testing.expect(app.worker.session_transition_held);
+
+    app.worker.worker_processing = false;
+    app.shell.has_committed_frame = false;
+    app.session_persistence.pending_live_session_wait = .{ .worker = 1 };
+    try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
+    try std.testing.expect(app.session_persistence.pending_live_session_policy == null);
+    try std.testing.expect(app.session_persistence.pending_live_session_wait == null);
+    try std.testing.expect(!app.worker.session_transition_held);
+}
+
 test "deferred paste settles before input from the next delivery epoch" {
     const alloc = std.testing.allocator;
     var sink = try std.Io.Dir.openFileAbsolute(std.testing.io, "/dev/null", .{ .mode = .write_only });
@@ -4293,7 +4329,7 @@ test "stalled fresh-session handoff replays Ctrl+C after timeout" {
     try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
     try std.testing.expectEqualStrings("", app.input_runtime.edit_state.input.items);
     try std.testing.expect(app.worker.queued_context_compaction != null);
-    app.session_persistence.pending_live_session_started_ms = 1;
+    app.session_persistence.pending_live_session_wait = .{ .geometry = 1 };
     try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
     try std.testing.expect(app.session_persistence.pending_live_session_policy == null);
     try std.testing.expect(app.worker.session_transition_held);
@@ -4337,7 +4373,7 @@ test "replayed new command retains the worker hold through a second deferred tra
     });
     for ("/new\r") |byte| try app.handleTerminalInputByte(byte);
     try app.terminal_input_runtime.markDeferredSessionDeliveryEpoch(alloc);
-    app.session_persistence.pending_live_session_started_ms = 1;
+    app.session_persistence.pending_live_session_wait = .{ .geometry = 1 };
     try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
     try std.testing.expect(app.worker.session_transition_held);
     try std.testing.expect((try app.worker.tryTakeNextWork(worker_alloc)) == null);
@@ -4374,7 +4410,7 @@ test "quit exits after a timed-out handoff without a completed input epoch" {
     for ("/quit\r") |byte| try app.handleTerminalInputByte(byte);
     try std.testing.expect(app.terminal_input_runtime.takeDeferredSessionInput() == null);
     try std.testing.expect(app.session_persistence.pending_live_session_policy != null);
-    app.session_persistence.pending_live_session_started_ms = 1;
+    app.session_persistence.pending_live_session_wait = .{ .geometry = 1 };
     try app_session_runtime.Runtime(App).settlePendingLiveSessionTransition(&app);
     try std.testing.expect(try app_input_runtime.Runtime(App).flushDeferredSessionInput(&app, App.input_limits, max_prompt_history));
     app_session_runtime.Runtime(App).finishDeferredSessionInputReplay(&app);
