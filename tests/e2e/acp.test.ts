@@ -5961,6 +5961,43 @@ describe("acp: model-independent", () => {
   );
 
   test(
+    "initialize explains a missing Codex model and acp --model starts without one saved",
+    async () => {
+      const root = createIsolatedRoot("fx-acp-codex-run-model-");
+      const gateway = startFakeGateway([]);
+      const codex = startAcpFakeCodex();
+      writeSeededAcpChatGptLogin(root.home, codex.accessToken);
+      const env = {
+        ...fakeGatewayEnv(root, gateway),
+        FX_PROVIDER: "codex",
+        FX_MODEL: undefined,
+        FX_E2E_OPENAI_CODEX_RESPONSES_URL: codex.responsesUrl,
+        FX_E2E_OPENAI_CODEX_MODELS_URL: codex.modelsUrl,
+        FX_E2E_CHATGPT_TOKEN_URL: codex.tokenUrl,
+      };
+      try {
+        client = await AcpClient.create({ cwd: root.workspace, env });
+        const refused = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(refused.error?.message).toBe(
+          "no Codex model is selected; run `fx provider codex` to choose one, or set a model for this run with --model or FX_MODEL",
+        );
+        await client.close();
+
+        client = await AcpClient.create({ cwd: root.workspace, env, args: ["acp", "--model", "gpt-5.4-mini"] });
+        const initialized = await client.request("initialize", { protocolVersion: 1 }, 1) as any;
+        expect(initialized.error).toBeUndefined();
+        expect(initialized.result.protocolVersion).toBe(1);
+        expect(codex.requests).toHaveLength(0);
+      } finally {
+        await client?.close();
+        codex.stop();
+        gateway.stop();
+        rmSync(root.root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  test(
     "selected text-only model rejects images without leaking an internal error",
     async () => {
       const root = createIsolatedRoot("fx-acp-image-model-capability-");
