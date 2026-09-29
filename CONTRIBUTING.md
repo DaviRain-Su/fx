@@ -73,6 +73,8 @@ Every PR must carry exactly one label that describes its primary intent:
 
 If you cannot manage labels, a maintainer or repository agent will apply the label before review. For a mixed PR, choose the label that best describes why the PR exists. Keep the title as a clean imperative sentence and do not add bracketed type prefixes such as `[bug]` or `[improvement]`.
 
+If an AI coding agent writes any of your contribution's prose, including the PR title and description, commit messages, documentation, and issues, it must use the `technical-writer` skill in `.fx/skills/technical-writer/`.
+
 ## Repo Shape
 
 * `src/main.zig`: composition root only
