@@ -75,8 +75,12 @@ pub const Settings = struct {
     notification_max: ?bool = null,
     permission_rules: types.PermissionRuleSet = .{},
     has_permission_rules: bool = false,
+    /// Owned absolute directories whose contents symlinked skills may resolve
+    /// into. Profile-only; a later layer replaces the whole list. Freed in deinit.
+    skill_symlink_authorities: ?[][]u8 = null,
 
     pub fn deinit(self: *Settings, alloc: Allocator) void {
+        if (self.skill_symlink_authorities) |paths| freeStringSlice(alloc, paths);
         self.models.deinit(alloc);
         if (self.providers) |*providers| providers.deinit(alloc);
         self.permission_rules.deinit(alloc);
@@ -204,6 +208,7 @@ pub const ConfigDiagnosticCause = enum {
     retired_skill_match_fuzzy,
     invalid_context_limits,
     invalid_additional_directories,
+    invalid_skill_symlink_authorities,
 };
 
 pub const ConfigDiagnostic = struct {
@@ -238,7 +243,16 @@ pub fn writeDiagnosticMetadata(writer: *std.Io.Writer, diagnostic: ConfigDiagnos
             .{workspace_access.max_additional_directories},
         );
     }
+    if (diagnostic.cause == .invalid_skill_symlink_authorities) {
+        try writer.print(
+            "; skill_symlink_authorities must be an array of at most {d} absolute directory paths without .. components",
+            .{max_skill_symlink_authorities},
+        );
+    }
 }
+
+/// Upper bound on profile `skill_symlink_authorities` entries.
+const max_skill_symlink_authorities: usize = 32;
 
 pub const DetailedSettings = struct {
     settings: Settings,
@@ -815,6 +829,7 @@ fn isProfileOnlySettingKey(key: []const u8) bool {
         "yolo_acknowledged",
         "permission",
         "additional_directories",
+        "skill_symlink_authorities",
     }) |profile_key| {
         if (std.mem.eql(u8, key, profile_key)) return true;
     }
@@ -981,6 +996,7 @@ fn diagnosticCauseForParseError(err: anyerror) ConfigDiagnosticCause {
         error.UnknownContextLimit,
         error.InvalidContextLimitValue,
         => .invalid_context_limits,
+        error.InvalidSkillSymlinkAuthorities => .invalid_skill_symlink_authorities,
         else => .malformed_settings,
     };
 }
@@ -1720,6 +1736,12 @@ fn parseProfileOnlyFields(
         settings.startup_scrollback = value.bool;
     }
 
+    if (root.object.get("skill_symlink_authorities")) |value| {
+        const paths = try parseSkillSymlinkAuthorities(alloc, value);
+        if (settings.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
+        settings.skill_symlink_authorities = paths;
+    }
+
     if (root.object.get("prompt_history")) |prompt_history_value| {
         if (prompt_history_value != .object) return error.InvalidPromptHistoryType;
         if (prompt_history_value.object.get("enabled")) |enabled| {
@@ -1781,6 +1803,42 @@ fn parseProfileOnlyFields(
         settings.permission_rules = try parsePermissionConfig(alloc, value);
         settings.has_permission_rules = true;
     }
+}
+
+/// Parses `skill_symlink_authorities` into caller-owned path copies. Every
+/// entry must be an absolute path without `..` components so a typo cannot
+/// silently widen or narrow the directories skills may resolve into.
+fn parseSkillSymlinkAuthorities(alloc: Allocator, value: std.json.Value) ![][]u8 {
+    if (value != .array) return error.InvalidSkillSymlinkAuthorities;
+    const items = value.array.items;
+    if (items.len > max_skill_symlink_authorities) return error.InvalidSkillSymlinkAuthorities;
+    for (items) |item| {
+        if (item != .string or
+            !std.fs.path.isAbsolute(item.string) or
+            pathHasDotDotComponent(item.string))
+        {
+            return error.InvalidSkillSymlinkAuthorities;
+        }
+    }
+    const paths = try alloc.alloc([]u8, items.len);
+    var filled: usize = 0;
+    errdefer {
+        for (paths[0..filled]) |path| alloc.free(path);
+        alloc.free(paths);
+    }
+    for (items) |item| {
+        paths[filled] = try alloc.dupe(u8, item.string);
+        filled += 1;
+    }
+    return paths;
+}
+
+fn pathHasDotDotComponent(path: []const u8) bool {
+    var it = std.fs.path.componentIterator(path);
+    while (it.next()) |component| {
+        if (std.mem.eql(u8, component.name, "..")) return true;
+    }
+    return false;
 }
 
 fn parseProjectSafeFields(settings: *Settings, alloc: Allocator, root: std.json.Value) !void {
@@ -1878,6 +1936,11 @@ fn mergeSettings(target: *Settings, incoming: *Settings, alloc: Allocator) !void
         incoming.theme = null;
     }
     if (incoming.startup_scrollback) |value| target.startup_scrollback = value;
+    if (incoming.skill_symlink_authorities) |value| {
+        if (target.skill_symlink_authorities) |old| freeStringSlice(alloc, old);
+        target.skill_symlink_authorities = value;
+        incoming.skill_symlink_authorities = null;
+    }
     if (incoming.prompt_history_enabled) |value| target.prompt_history_enabled = value;
     if (incoming.effort) |value| target.effort = value;
     if (incoming.review_model) |value| {
@@ -2646,6 +2709,104 @@ test "startup_scrollback parses merges rejects invalid type and round trips" {
     const json = try serializeJsonObject(std.testing.allocator, parsed.value);
     defer std.testing.allocator.free(json);
     try std.testing.expect(std.mem.find(u8, json, "\"startup_scrollback\":false") != null);
+}
+
+test "skill_symlink_authorities parses replaces on merge and rejects invalid entries" {
+    const alloc = std.testing.allocator;
+
+    var absent = try parseSettingsJson(alloc, "{}");
+    defer absent.deinit(alloc);
+    try std.testing.expect(absent.skill_symlink_authorities == null);
+
+    var first = try parseSettingsJson(alloc, "{\"skill_symlink_authorities\":[\"/Applications/Codiff.app/Contents/Resources/app/codex/skills\",\"/nix/store\"]}");
+    defer first.deinit(alloc);
+    const parsed_paths = first.skill_symlink_authorities.?;
+    try std.testing.expectEqual(@as(usize, 2), parsed_paths.len);
+    try std.testing.expectEqualStrings("/Applications/Codiff.app/Contents/Resources/app/codex/skills", parsed_paths[0]);
+    try std.testing.expectEqualStrings("/nix/store", parsed_paths[1]);
+
+    var second = try parseSettingsJson(alloc, "{\"skill_symlink_authorities\":[]}");
+    defer second.deinit(alloc);
+    try mergeSettings(&first, &second, alloc);
+    try std.testing.expectEqual(@as(usize, 0), first.skill_symlink_authorities.?.len);
+
+    inline for (&.{
+        "{\"skill_symlink_authorities\":\"/nix/store\"}",
+        "{\"skill_symlink_authorities\":[7]}",
+        "{\"skill_symlink_authorities\":[\"relative/skills\"]}",
+        "{\"skill_symlink_authorities\":[\"/opt/../etc\"]}",
+    }) |json| {
+        try std.testing.expectError(error.InvalidSkillSymlinkAuthorities, parseSettingsJson(alloc, json));
+    }
+}
+
+test "skill_symlink_authorities is profile-only and workspace overrides replace the global list" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    try tmp.dir.createDirPath(io_mod.getIo(), "project-only");
+
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    const project_only_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "project-only");
+    defer alloc.free(project_only_root);
+
+    const user_settings = try std.fmt.allocPrint(
+        alloc,
+        "{{\"skill_symlink_authorities\":[\"/opt/global-skills\"],\"workspaces\":{{\"{s}\":{{\"skill_symlink_authorities\":[\"/opt/workspace-skills\"]}}}}}}",
+        .{workspace_root},
+    );
+    defer alloc.free(user_settings);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", user_settings);
+    try writeFixtureFile(tmp.dir, "workspace/.fx.json", "{\"skill_symlink_authorities\":[\"/opt/project-skills\"]}");
+    try writeFixtureFile(tmp.dir, "project-only/.fx.json", "{\"skill_symlink_authorities\":[\"/opt/project-skills\"]}");
+
+    var workspace = try loadMergedSettingsFromHome(alloc, home_root, workspace_root);
+    defer workspace.deinit(alloc);
+    const workspace_paths = workspace.skill_symlink_authorities.?;
+    try std.testing.expectEqual(@as(usize, 1), workspace_paths.len);
+    try std.testing.expectEqualStrings("/opt/workspace-skills", workspace_paths[0]);
+
+    // A committed project file must never grant filesystem authority.
+    var project_only = try loadMergedSettingsFromHome(alloc, home_root, project_only_root);
+    defer project_only.deinit(alloc);
+    const project_only_paths = project_only.skill_symlink_authorities.?;
+    try std.testing.expectEqual(@as(usize, 1), project_only_paths.len);
+    try std.testing.expectEqualStrings("/opt/global-skills", project_only_paths[0]);
+}
+
+test "invalid skill_symlink_authorities reports a specific diagnostic" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io_mod.getIo(), "home/.fx");
+    try tmp.dir.createDirPath(io_mod.getIo(), "workspace");
+    const home_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "home");
+    defer alloc.free(home_root);
+    const workspace_root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, "workspace");
+    defer alloc.free(workspace_root);
+    try writeFixtureFile(tmp.dir, "home/.fx/settings.json", "{\"skill_symlink_authorities\":[\"relative/skills\"]}");
+
+    var detailed = try loadMergedSettingsDetailedFromHome(alloc, home_root, workspace_root);
+    defer detailed.deinit(alloc);
+    try std.testing.expect(detailed.settings.skill_symlink_authorities == null);
+    var found = false;
+    for (detailed.diagnostics) |diagnostic| {
+        if (diagnostic.layer != .user) continue;
+        if (diagnostic.cause != .invalid_skill_symlink_authorities) continue;
+        found = true;
+        var buffer: [512]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buffer);
+        try writeDiagnosticMetadata(&writer, diagnostic);
+        try std.testing.expect(std.mem.find(u8, writer.buffered(), "skill_symlink_authorities must be an array") != null);
+    }
+    try std.testing.expect(found);
 }
 
 test "collapse tool calls parses merges and rejects invalid types" {

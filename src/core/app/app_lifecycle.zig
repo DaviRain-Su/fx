@@ -10,6 +10,7 @@ const model_capabilities = @import("../config/model_capabilities.zig");
 const model_provider = @import("../config/model_provider.zig");
 const debug_trace = @import("../shared/debug_trace.zig");
 const profile_paths = @import("../shared/profile_paths.zig");
+const skill_runtime = @import("../skills/skill_runtime.zig");
 const shared_theme = @import("../shared/theme.zig");
 const record_tape = @import("../workspace/record_tape.zig");
 const workspace_access = @import("../workspace/workspace_access.zig");
@@ -616,6 +617,9 @@ fn loadStartupStateFromOwnedWorkspace(
         &.{},
         false,
     );
+    // Skill authority checks run across discovery, refresh, and the skill tool,
+    // so the profile setting is installed process-wide like the env var.
+    try skill_runtime.setConfiguredSymlinkAuthorities(settings.skill_symlink_authorities orelse &.{});
 
     // A launch --provider override must bind configured provider names against
     // the registry just like the settings and FX_PROVIDER paths do.
