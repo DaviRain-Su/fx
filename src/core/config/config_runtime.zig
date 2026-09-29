@@ -4460,6 +4460,12 @@ test "selectProviderModel accepts the run model when the provider has none saved
     const env_grok = try selectProviderModel("default/model", &missing_grok, null, "grok-env");
     try std.testing.expectEqualStrings("grok-env", env_grok.model);
 
+    // FX_PROVIDER=local names a custom connection, which has no default either.
+    const missing_local = Settings{ .provider = model_provider.parse("local").? };
+    try std.testing.expectError(error.ConfiguredModelNotSelected, selectProviderModel("default/model", &missing_local, null, null));
+    const env_local = try selectProviderModel("default/model", &missing_local, null, "local-env");
+    try std.testing.expectEqualStrings("local-env", env_local.model);
+
     // --provider codex with FX_MODEL from a Gateway-only profile.
     const gateway_only = Settings{ .provider = .gateway };
     const launched = try selectProviderModel("default/model", &gateway_only, .codex, "gpt-env");
